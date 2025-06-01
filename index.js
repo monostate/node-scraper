@@ -398,13 +398,17 @@ export class BNCASmartScraper {
       /__webpack_require__/i
     ];
     
-    // Check for protection systems
+    // Check for protection systems (more specific patterns)
     const protectionIndicators = [
-      /cloudflare/i,
+      /cloudflare.*challenge/i,
+      /cloudflare.*protection/i,
+      /ray id.*cloudflare/i,
       /please enable javascript/i,
       /you need to enable javascript/i,
       /this site requires javascript/i,
-      /jscript.*required/i
+      /jscript.*required/i,
+      /security check.*cloudflare/i,
+      /attention required.*cloudflare/i
     ];
     
     // Check for minimal content (likely SPA)
@@ -448,7 +452,10 @@ export class BNCASmartScraper {
     if (/window\.__NEXT_DATA__/i.test(html)) {
       indicators.push('Next.js data detected');
     }
-    if (/cloudflare/i.test(html)) {
+    if (/cloudflare.*challenge/i.test(html)) {
+      indicators.push('Cloudflare challenge detected');
+    }
+    if (/cloudflare.*protection/i.test(html)) {
       indicators.push('Cloudflare protection detected');
     }
     if (/please enable javascript/i.test(html)) {

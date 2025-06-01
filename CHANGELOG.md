@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1] - 2025-01-18
+
+### Fixed
+- Fixed false positives in browser requirement detection for sites using Cloudflare CDN
+- Updated Cloudflare detection to be more specific (only triggers on actual protection/challenge pages, not CDN usage)
+- Improved direct fetch success rate for Shopify and other sites using Cloudflare CDN
+
 ## [1.1.0] - 2025-05-31
 
 ### Added
