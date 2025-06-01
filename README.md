@@ -19,6 +19,15 @@ yarn add @monostate/node-scraper
 pnpm add @monostate/node-scraper
 ```
 
+**🎉 New in v1.2.0**: Lightpanda binary is now automatically downloaded and configured during installation! No manual setup required.
+
+### Zero-Configuration Setup
+
+The package now automatically:
+- 📦 Downloads the correct Lightpanda binary for your platform (macOS, Linux, Windows/WSL)
+- 🔧 Configures binary paths and permissions
+- ✅ Validates installation health on first use
+
 ### Basic Usage
 
 ```javascript
@@ -342,6 +351,24 @@ const scraper: BNCASmartScraper = new BNCASmartScraper({
 
 const result: ScrapingResult = await scraper.scrape('https://example.com');
 ```
+
+## 📋 Changelog
+
+### v1.2.0 (Latest)
+- 🎉 **Auto-Installation**: Lightpanda binary is now automatically downloaded during `npm install`
+- 🔧 **Cross-Platform Support**: Automatic detection and installation for macOS, Linux, and Windows/WSL
+- ⚡ **Improved Performance**: Enhanced binary detection and ES6 module compatibility
+- 🛠️ **Better Error Handling**: More robust installation scripts with retry logic
+- 📦 **Zero Configuration**: No manual setup required - works out of the box
+
+### v1.1.1
+- Bug fixes and stability improvements
+- Enhanced Puppeteer integration
+
+### v1.1.0
+- Added screenshot capabilities
+- Improved fallback system
+- Performance optimizations
 
 ## 🤝 Contributing
 

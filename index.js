@@ -1,6 +1,7 @@
 import fetch from 'node-fetch';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import fs from 'fs/promises';
+import { existsSync, statSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fsPromises } from 'fs';
@@ -201,7 +202,13 @@ export class BNCASmartScraper {
     
     try {
       // Check if binary exists
-      await fs.access(this.options.lightpandaPath);
+      const stats = statSync(this.options.lightpandaPath);
+      if (!stats.isFile()) {
+        return {
+          success: false,
+          error: 'Lightpanda binary is not a file'
+        };
+      }
     } catch {
       return {
         success: false,
@@ -210,9 +217,9 @@ export class BNCASmartScraper {
     }
     
     return new Promise((resolve) => {
-      const args = ['fetch', '--dump', '--timeout', Math.floor(config.timeout / 1000).toString(), url];
+      const args = ['fetch', '--dump', url];
       const process = spawn(this.options.lightpandaPath, args, {
-        timeout: config.timeout + 1000 // Add buffer
+        timeout: config.timeout + 1000 // Add buffer for process timeout only
       });
       
       let output = '';
@@ -387,7 +394,21 @@ export class BNCASmartScraper {
    * Intelligent detection of browser requirement
    */
   detectBrowserRequirement(html, url) {
-    // Check for common SPA patterns
+    // Whitelist simple sites that should always use direct fetch
+    const simpleSites = [
+      'example.com',
+      'httpbin.org',
+      'wikipedia.org',
+      'github.io',
+      'netlify.app',
+      'vercel.app'
+    ];
+    
+    if (simpleSites.some(site => url.includes(site))) {
+      return false; // Always use direct fetch for these
+    }
+    
+    // Check for common SPA patterns (be more specific)
     const spaIndicators = [
       /<div[^>]*id=['"]?root['"]?[^>]*>\s*<\/div>/i,
       /<div[^>]*id=['"]?app['"]?[^>]*>\s*<\/div>/i,
@@ -411,7 +432,23 @@ export class BNCASmartScraper {
       /attention required.*cloudflare/i
     ];
     
-    // Check for minimal content (likely SPA)
+    // Domain-based checks for known SPA sites
+    const domainIndicators = [
+      /instagram\.com/i,
+      /twitter\.com/i,
+      /facebook\.com/i,
+      /linkedin\.com/i,
+      /maps\.google/i,
+      /gmail\.com/i,
+      /youtube\.com/i
+    ];
+    
+    // Check if it's clearly a SPA or protected site
+    const hasSpaIndicators = spaIndicators.some(pattern => pattern.test(html));
+    const hasProtection = protectionIndicators.some(pattern => pattern.test(html));
+    const isKnownSpa = domainIndicators.some(pattern => pattern.test(url));
+    
+    // Check for minimal content BUT only if we also have SPA indicators
     const bodyContent = html.match(/<body[^>]*>([\s\S]*)<\/body>/i)?.[1] || '';
     const textContent = bodyContent
       .replace(/<script[\s\S]*?<\/script>/gi, '')
@@ -420,22 +457,11 @@ export class BNCASmartScraper {
       .replace(/\s+/g, ' ')
       .trim();
     
-    const hasMinimalContent = textContent.length < 500;
+    const hasMinimalContent = textContent.length < 200; // More conservative threshold
+    const isLikelySpa = hasMinimalContent && hasSpaIndicators;
     
-    // Domain-based checks
-    const domainIndicators = [
-      /instagram\.com/i,
-      /twitter\.com/i,
-      /facebook\.com/i,
-      /linkedin\.com/i,
-      /maps\.google/i
-    ];
-    
-    const needsBrowser = 
-      spaIndicators.some(pattern => pattern.test(html)) ||
-      protectionIndicators.some(pattern => pattern.test(html)) ||
-      (hasMinimalContent && spaIndicators.some(pattern => pattern.test(html))) ||
-      domainIndicators.some(pattern => pattern.test(url));
+    // Only require browser if we have strong indicators
+    const needsBrowser = hasProtection || isKnownSpa || isLikelySpa;
     
     return needsBrowser;
   }
@@ -541,25 +567,58 @@ export class BNCASmartScraper {
    * Find Lightpanda binary
    */
   findLightpandaBinary() {
+    // First check the package's bin directory (installed by postinstall script)
+    const packageDir = path.dirname(new URL(import.meta.url).pathname);
+    const packageBinPath = path.join(packageDir, 'bin', 'lightpanda');
+    
     const possiblePaths = [
+      packageBinPath, // Package's bin directory (highest priority)
       './lightpanda',
       '../lightpanda',
       './lightpanda/lightpanda',
       '/usr/local/bin/lightpanda',
-      path.join(process.cwd(), 'lightpanda')
+      path.join(process.cwd(), 'lightpanda'),
+      path.join(process.cwd(), 'bin', 'lightpanda')
     ];
     
     for (const binaryPath of possiblePaths) {
       try {
-        // Synchronous check for binary
+        // Synchronous check for binary existence and executability
         const fullPath = path.resolve(binaryPath);
-        return fullPath;
+        if (existsSync(fullPath)) {
+          const stats = statSync(fullPath);
+          if (stats.isFile()) {
+            // Check if it's executable (on Unix-like systems including WSL)
+            if (process.platform !== 'win32' || this.isWSL()) {
+              const mode = stats.mode;
+              const isExecutable = Boolean(mode & parseInt('111', 8));
+              if (isExecutable) {
+                return fullPath;
+              }
+            } else {
+              // On native Windows (not WSL), Lightpanda is not supported
+              continue;
+            }
+          }
+        }
       } catch {
         continue;
       }
     }
     
     return null;
+  }
+  
+  /**
+   * Check if running in WSL environment
+   */
+  isWSL() {
+    try {
+      const uname = execSync('uname -r', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      return uname.toLowerCase().includes('microsoft') || uname.toLowerCase().includes('wsl');
+    } catch {
+      return false;
+    }
   }
   
   /**
