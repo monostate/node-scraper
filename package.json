@@ -1,0 +1,67 @@
+{
+  "name": "@monostate/node-scraper",
+  "version": "1.1.0",
+  "description": "Intelligent web scraping with multi-level fallback system - 11.35x faster than Firecrawl",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "types": "./index.d.ts"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "package.json"
+  ],
+  "keywords": [
+    "web-scraping",
+    "crawling",
+    "lightpanda",
+    "puppeteer",
+    "fast-scraping",
+    "intelligent-fallback",
+    "data-extraction",
+    "automation",
+    "browser",
+    "nextjs",
+    "react",
+    "performance",
+    "firecrawl-alternative"
+  ],
+  "author": "BNCA Team",
+  "license": "MIT",
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "peerDependencies": {
+    "puppeteer": ">=20.0.0"
+  },
+  "peerDependenciesMeta": {
+    "puppeteer": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monostate/node-scraper.git",
+    "directory": "packages/smart-scraper"
+  },
+  "bugs": {
+    "url": "https://github.com/monostate/node-scraper/issues"
+  },
+  "homepage": "https://github.com/monostate/node-scraper/tree/main/packages/smart-scraper#readme",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/monostate"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
