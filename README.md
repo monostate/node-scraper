@@ -2,7 +2,7 @@
 
 > **Lightning-fast web scraping with intelligent fallback system - 11.35x faster than Firecrawl**
 
-[![npm version](https://badge.fury.io/js/%40monostate%2Fnode-scraper.svg)](https://badge.fury.io/js/%40monostate%2Fnode-scraper)
+[![npm version](https://img.shields.io/npm/v/@monostate/node-scraper.svg)](https://www.npmjs.com/package/@monostate/node-scraper)
 [![Performance](https://img.shields.io/badge/Performance-11.35x_faster_than_Firecrawl-brightgreen)](../../test-results/) 
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 [![Node](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/)
@@ -464,7 +464,18 @@ const result: ScrapingResult = await scraper.scrape('https://example.com');
 
 ## 📋 Changelog
 
-### v1.3.0 (Latest)
+### v1.5.0 (Latest)
+- 🤖 **AI-Powered Q&A**: Ask questions about any website and get AI-generated answers
+- 🌐 **OpenRouter Support**: Native integration with OpenRouter API for advanced AI models
+- 🧠 **OpenAI Support**: Compatible with OpenAI and OpenAI-compatible endpoints (Groq, Together AI, etc.)
+- 🔄 **Smart Fallback**: Automatic fallback chain: OpenRouter → OpenAI → Backend API → Local processing
+- 🎯 **One-liner AI**: New `askWebsiteAI()` convenience function for quick AI queries
+- 📘 **Enhanced TypeScript**: Complete type definitions for all AI features
+
+### v1.4.0
+- Internal release (skipped for public release)
+
+### v1.3.0
 - 📄 **PDF Support**: Full PDF parsing with text extraction, metadata, and page count
 - 🔍 **Smart PDF Detection**: Detects PDFs by URL patterns, content-type, or magic bytes
 - 🚀 **Robust Parsing**: Handles PDFs served with incorrect content-types (e.g., GitHub raw files)
