@@ -5,6 +5,7 @@ import { existsSync, statSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fsPromises } from 'fs';
+import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 
 let puppeteer = null;
 try {
@@ -42,7 +43,8 @@ export class BNCASmartScraper {
     this.stats = {
       directFetch: { attempts: 0, successes: 0 },
       lightpanda: { attempts: 0, successes: 0 },
-      puppeteer: { attempts: 0, successes: 0 }
+      puppeteer: { attempts: 0, successes: 0 },
+      pdf: { attempts: 0, successes: 0 }
     };
   }
   
@@ -60,6 +62,35 @@ export class BNCASmartScraper {
     let lastError = null;
     
     try {
+      // Check if URL is a PDF (by extension or content-type check)
+      const isPdfUrl = url.toLowerCase().endsWith('.pdf') || 
+                       url.toLowerCase().includes('.pdf?') ||
+                       url.toLowerCase().includes('/pdf/');
+                       
+      if (isPdfUrl) {
+        this.log('  📄 PDF detected, using PDF parser...');
+        result = await this.tryPDFParse(url, config);
+        
+        if (result.success) {
+          method = 'pdf';
+          this.log('  ✅ PDF parsing successful');
+          
+          const totalTime = Date.now() - startTime;
+          return {
+            ...result,
+            method,
+            performance: {
+              totalTime,
+              method
+            },
+            stats: this.getStats()
+          };
+        } else {
+          this.log('  ❌ PDF parsing failed');
+          lastError = result.error;
+        }
+      }
+      
       // Step 1: Try direct fetch first (fastest)
       this.log('  🔄 Attempting direct fetch...');
       result = await this.tryDirectFetch(url, config);
@@ -67,6 +98,29 @@ export class BNCASmartScraper {
       if (result.success && !result.needsBrowser) {
         method = 'direct-fetch';
         this.log('  ✅ Direct fetch successful');
+      } else if (result.isPdf) {
+        // Direct fetch detected a PDF, try PDF parser
+        this.log('  📄 Direct fetch detected PDF content, using PDF parser...');
+        result = await this.tryPDFParse(url, config);
+        
+        if (result.success) {
+          method = 'pdf';
+          this.log('  ✅ PDF parsing successful');
+          
+          const totalTime = Date.now() - startTime;
+          return {
+            ...result,
+            method,
+            performance: {
+              totalTime,
+              method
+            },
+            stats: this.getStats()
+          };
+        } else {
+          this.log('  ❌ PDF parsing failed');
+          lastError = result.error;
+        }
       } else {
         this.log(result.needsBrowser ? '  ⚠️  Browser rendering required' : '  ❌ Direct fetch failed');
         lastError = result.error;
@@ -152,7 +206,32 @@ export class BNCASmartScraper {
         };
       }
       
-      const html = await response.text();
+      // Check if the response is actually a PDF
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/pdf')) {
+        return {
+          success: false,
+          error: 'Content is PDF, should use PDF parser',
+          isPdf: true
+        };
+      }
+      
+      // Get response as array buffer to check magic bytes
+      const buffer = await response.arrayBuffer();
+      const firstBytes = new Uint8Array(buffer.slice(0, 5));
+      const signature = Array.from(firstBytes).map(b => String.fromCharCode(b)).join('');
+      
+      // Check for PDF magic bytes
+      if (signature.startsWith('%PDF')) {
+        return {
+          success: false,
+          error: 'Content is PDF (detected by magic bytes), should use PDF parser',
+          isPdf: true
+        };
+      }
+      
+      // Convert buffer back to text for HTML processing
+      const html = new TextDecoder().decode(buffer);
       
       // Intelligent browser detection
       const needsBrowser = this.detectBrowserRequirement(html, url);
@@ -386,6 +465,95 @@ export class BNCASmartScraper {
       return {
         success: false,
         error: error.message
+      };
+    }
+  }
+  
+  /**
+   * PDF parsing method - handles PDF documents
+   */
+  async tryPDFParse(url, config) {
+    this.stats.pdf.attempts++;
+    
+    try {
+      // Download PDF with timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), config.timeout);
+      
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': config.userAgent,
+          'Accept': 'application/pdf,*/*'
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        return {
+          success: false,
+          error: `HTTP ${response.status}: ${response.statusText}`
+        };
+      }
+      
+      // Check content type (be lenient - accept various content types)
+      const contentType = response.headers.get('content-type') || '';
+      const acceptableTypes = ['pdf', 'octet-stream', 'binary', 'download'];
+      const isAcceptableType = acceptableTypes.some(type => contentType.includes(type));
+      
+      if (!isAcceptableType && !url.toLowerCase().includes('.pdf')) {
+        return {
+          success: false,
+          error: `Not a PDF document: ${contentType}`
+        };
+      }
+      
+      // Get PDF buffer
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      
+      // Check size limit (20MB)
+      if (buffer.length > 20 * 1024 * 1024) {
+        return {
+          success: false,
+          error: 'PDF too large (max 20MB)'
+        };
+      }
+      
+      // Parse PDF
+      const pdfData = await pdfParse(buffer);
+      
+      // Extract structured content
+      const content = {
+        title: pdfData.info?.Title || 'Untitled PDF',
+        author: pdfData.info?.Author || '',
+        subject: pdfData.info?.Subject || '',
+        keywords: pdfData.info?.Keywords || '',
+        creator: pdfData.info?.Creator || '',
+        producer: pdfData.info?.Producer || '',
+        creationDate: pdfData.info?.CreationDate || '',
+        modificationDate: pdfData.info?.ModificationDate || '',
+        pages: pdfData.numpages || 0,
+        text: pdfData.text || '',
+        metadata: pdfData.metadata || null,
+        url: url
+      };
+      
+      this.stats.pdf.successes++;
+      
+      return {
+        success: true,
+        content: JSON.stringify(content, null, 2),
+        size: buffer.length,
+        contentType: 'application/pdf',
+        pages: content.pages
+      };
+      
+    } catch (error) {
+      return {
+        success: false,
+        error: `PDF parsing error: ${error.message}`
       };
     }
   }
@@ -633,7 +801,9 @@ export class BNCASmartScraper {
         lightpanda: this.stats.lightpanda.attempts > 0 ? 
           (this.stats.lightpanda.successes / this.stats.lightpanda.attempts * 100).toFixed(1) + '%' : '0%',
         puppeteer: this.stats.puppeteer.attempts > 0 ? 
-          (this.stats.puppeteer.successes / this.stats.puppeteer.attempts * 100).toFixed(1) + '%' : '0%'
+          (this.stats.puppeteer.successes / this.stats.puppeteer.attempts * 100).toFixed(1) + '%' : '0%',
+        pdf: this.stats.pdf.attempts > 0 ? 
+          (this.stats.pdf.successes / this.stats.pdf.attempts * 100).toFixed(1) + '%' : '0%'
       }
     };
   }

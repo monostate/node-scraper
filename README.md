@@ -19,7 +19,9 @@ yarn add @monostate/node-scraper
 pnpm add @monostate/node-scraper
 ```
 
-**🎉 New in v1.2.0**: Lightpanda binary is now automatically downloaded and configured during installation! No manual setup required.
+**🎉 New in v1.3.0**: PDF parsing support added! Automatically extracts text, metadata, and page count from PDF documents.
+
+**✨ Also in v1.2.0**: Lightpanda binary is now automatically downloaded and configured during installation! No manual setup required.
 
 ### Zero-Configuration Setup
 
@@ -45,6 +47,10 @@ console.log(screenshot.screenshot); // Base64 encoded image
 // Quick screenshot (optimized for speed)
 const quick = await quickShot('https://example.com');
 console.log(quick.screenshot); // Fast screenshot capture
+
+// PDF parsing (automatic detection)
+const pdfResult = await smartScrape('https://example.com/document.pdf');
+console.log(pdfResult.content); // Extracted text, metadata, page count
 ```
 
 ### Advanced Usage
@@ -66,12 +72,13 @@ await scraper.cleanup(); // Clean up resources
 
 ## 🔧 How It Works
 
-BNCA uses a sophisticated 3-tier fallback system:
+BNCA uses a sophisticated multi-tier system with intelligent detection:
 
 ### 1. 🔄 Direct Fetch (Fastest)
 - Pure HTTP requests with intelligent HTML parsing
 - **Performance**: Sub-second responses
 - **Success rate**: 75% of websites
+- **PDF Detection**: Automatically detects PDFs by URL, content-type, or magic bytes
 
 ### 2. 🐼 Lightpanda Browser (Fast)
 - Lightweight browser engine (2-3x faster than Chromium)
@@ -82,6 +89,12 @@ BNCA uses a sophisticated 3-tier fallback system:
 - Full Chromium browser for maximum compatibility
 - **Performance**: Complete JavaScript execution
 - **Fallback triggers**: Complex interactions needed
+
+### 📄 PDF Parser (Specialized)
+- Automatic PDF detection and parsing
+- **Features**: Text extraction, metadata, page count
+- **Smart Detection**: Works even when PDFs are served with wrong content-types
+- **Performance**: Typically 100-500ms for most PDFs
 
 ### 📸 Screenshot Methods
 - **Chrome CLI**: Direct Chrome screenshot capture
@@ -185,6 +198,34 @@ Clean up resources (close browser instances).
 ```javascript
 await scraper.cleanup();
 ```
+
+### 📄 PDF Support
+
+BNCA automatically detects and parses PDF documents:
+
+```javascript
+const pdfResult = await smartScrape('https://example.com/document.pdf');
+
+// Parsed content includes:
+const content = JSON.parse(pdfResult.content);
+console.log(content.title);          // PDF title
+console.log(content.author);         // Author name
+console.log(content.pages);          // Number of pages
+console.log(content.text);           // Full extracted text
+console.log(content.creationDate);   // Creation date
+console.log(content.metadata);       // Additional metadata
+```
+
+**PDF Detection Methods:**
+- URL ending with `.pdf`
+- Content-Type header `application/pdf`
+- Binary content starting with `%PDF` (magic bytes)
+- Works with PDFs served as `application/octet-stream` (e.g., GitHub raw files)
+
+**Limitations:**
+- Maximum file size: 20MB
+- Text extraction only (no image OCR)
+- Requires `pdf-parse` dependency (automatically installed)
 
 ## 📱 Next.js Integration
 
@@ -354,7 +395,14 @@ const result: ScrapingResult = await scraper.scrape('https://example.com');
 
 ## 📋 Changelog
 
-### v1.2.0 (Latest)
+### v1.3.0 (Latest)
+- 📄 **PDF Support**: Full PDF parsing with text extraction, metadata, and page count
+- 🔍 **Smart PDF Detection**: Detects PDFs by URL patterns, content-type, or magic bytes
+- 🚀 **Robust Parsing**: Handles PDFs served with incorrect content-types (e.g., GitHub raw files)
+- ⚡ **Fast Performance**: PDF parsing typically completes in 100-500ms
+- 📊 **Comprehensive Extraction**: Title, author, creation date, page count, and full text
+
+### v1.2.0
 - 🎉 **Auto-Installation**: Lightpanda binary is now automatically downloaded during `npm install`
 - 🔧 **Cross-Platform Support**: Automatic detection and installation for macOS, Linux, and Windows/WSL
 - ⚡ **Improved Performance**: Enhanced binary detection and ES6 module compatibility
