@@ -19,7 +19,9 @@ yarn add @monostate/node-scraper
 pnpm add @monostate/node-scraper
 ```
 
-**🎉 New in v1.3.0**: PDF parsing support added! Automatically extracts text, metadata, and page count from PDF documents.
+**🤖 New in v1.5.0**: AI-powered Q&A! Ask questions about any website using OpenRouter, OpenAI, or built-in AI. (Note: v1.4.0 was an internal release)
+
+**🎉 Also in v1.3.0**: PDF parsing support added! Automatically extracts text, metadata, and page count from PDF documents.
 
 **✨ Also in v1.2.0**: Lightpanda binary is now automatically downloaded and configured during installation! No manual setup required.
 
@@ -197,6 +199,73 @@ Clean up resources (close browser instances).
 
 ```javascript
 await scraper.cleanup();
+```
+
+### 🤖 AI-Powered Q&A
+
+Ask questions about any website and get AI-generated answers:
+
+```javascript
+// Method 1: Using your own OpenRouter API key
+const scraper = new BNCASmartScraper({
+  openRouterApiKey: 'your-openrouter-api-key'
+});
+const result = await scraper.askAI('https://example.com', 'What is this website about?');
+
+// Method 2: Using OpenAI API (or compatible endpoints)
+const scraper = new BNCASmartScraper({
+  openAIApiKey: 'your-openai-api-key',
+  // Optional: Use a compatible endpoint like Groq, Together AI, etc.
+  openAIBaseUrl: 'https://api.groq.com/openai'
+});
+const result = await scraper.askAI('https://example.com', 'What services do they offer?');
+
+// Method 3: One-liner with OpenRouter
+import { askWebsiteAI } from '@monostate/node-scraper';
+const answer = await askWebsiteAI('https://example.com', 'What is the main topic?', {
+  openRouterApiKey: process.env.OPENROUTER_API_KEY
+});
+
+// Method 4: Using BNCA backend API (requires BNCA API key)
+const scraper = new BNCASmartScraper({
+  apiKey: 'your-bnca-api-key'
+});
+const result = await scraper.askAI('https://example.com', 'What products are featured?');
+```
+
+**API Key Priority:**
+1. OpenRouter API key (`openRouterApiKey`)
+2. OpenAI API key (`openAIApiKey`)
+3. BNCA backend API (`apiKey`)
+4. Local fallback (pattern matching - no API key required)
+
+**Configuration Options:**
+```javascript
+const result = await scraper.askAI(url, question, {
+  // OpenRouter specific
+  openRouterApiKey: 'sk-or-...',
+  model: 'meta-llama/llama-4-scout:free', // Default model
+  
+  // OpenAI specific
+  openAIApiKey: 'sk-...',
+  openAIBaseUrl: 'https://api.openai.com', // Or compatible endpoint
+  model: 'gpt-3.5-turbo',
+  
+  // Shared options
+  temperature: 0.3,
+  maxTokens: 500
+});
+```
+
+**Response Format:**
+```javascript
+{
+  success: true,
+  answer: "This website is about...",
+  method: "direct-fetch",     // Scraping method used
+  scrapeTime: 1234,          // Time to scrape in ms
+  processing: "openrouter"   // AI processing method used
+}
 ```
 
 ### 📄 PDF Support

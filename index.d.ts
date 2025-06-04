@@ -13,6 +13,24 @@ export interface ScrapingOptions {
   lightpandaPath?: string;
   /** Custom user agent string */
   userAgent?: string;
+  /** BNCA API key for backend services */
+  apiKey?: string;
+  /** BNCA API URL (defaults to https://bnca-api.fly.dev) */
+  apiUrl?: string;
+  /** OpenRouter API key for AI processing */
+  openRouterApiKey?: string;
+  /** OpenAI API key for AI processing */
+  openAIApiKey?: string;
+  /** OpenAI base URL (for compatible endpoints) */
+  openAIBaseUrl?: string;
+  /** AI model to use */
+  model?: string;
+  /** AI temperature setting */
+  temperature?: number;
+  /** Maximum tokens for AI response */
+  maxTokens?: number;
+  /** HTTP referer for OpenRouter */
+  referer?: string;
 }
 
 export interface ScrapingResult {
@@ -146,6 +164,22 @@ export class BNCASmartScraper {
    * @returns Promise resolving to screenshot result
    */
   quickshot(url: string, options?: ScrapingOptions): Promise<ScrapingResult>;
+  
+  /**
+   * Ask AI a question about a URL
+   * @param url The URL to analyze
+   * @param question The question to answer about the page
+   * @param options Optional configuration overrides
+   * @returns Promise resolving to AI answer
+   */
+  askAI(url: string, question: string, options?: ScrapingOptions): Promise<{
+    success: boolean;
+    answer?: string;
+    error?: string;
+    method?: string;
+    scrapeTime?: number;
+    processing?: 'openrouter' | 'openai' | 'backend' | 'local';
+  }>;
 
   /**
    * Get performance statistics for all methods
@@ -247,6 +281,22 @@ export function smartScreenshot(url: string, options?: ScrapingOptions): Promise
  * @returns Promise resolving to screenshot result
  */
 export function quickShot(url: string, options?: ScrapingOptions): Promise<ScrapingResult>;
+
+/**
+ * Convenience function for asking AI questions about a webpage
+ * @param url The URL to analyze
+ * @param question The question to answer
+ * @param options Optional configuration
+ * @returns Promise resolving to AI answer
+ */
+export function askWebsiteAI(url: string, question: string, options?: ScrapingOptions): Promise<{
+  success: boolean;
+  answer?: string;
+  error?: string;
+  method?: string;
+  scrapeTime?: number;
+  processing?: 'openrouter' | 'openai' | 'backend' | 'local';
+}>;
 
 /**
  * Default export - same as BNCASmartScraper class

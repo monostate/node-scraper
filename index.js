@@ -49,6 +49,232 @@ export class BNCASmartScraper {
   }
   
   /**
+   * Ask AI a question about a URL
+   * Scrapes the URL and uses AI to answer the question
+   * 
+   * @param {string} url - URL to analyze
+   * @param {string} question - Question to answer
+   * @param {object} options - Additional options
+   * @returns {Promise<object>} AI response with answer
+   */
+  async askAI(url, question, options = {}) {
+    try {
+      // First scrape the content
+      const scrapeResult = await this.scrape(url, options);
+      
+      if (!scrapeResult.success) {
+        return {
+          success: false,
+          error: `Failed to scrape URL: ${scrapeResult.error}`,
+          method: scrapeResult.method
+        };
+      }
+      
+      // Check for OpenRouter/OpenAI API key
+      const openRouterKey = options.openRouterApiKey || this.options.openRouterApiKey || process.env.OPENROUTER_API_KEY;
+      const openAIKey = options.openAIApiKey || this.options.openAIApiKey || process.env.OPENAI_API_KEY;
+      
+      // Priority: OpenRouter > OpenAI > Backend API > Local
+      if (openRouterKey) {
+        try {
+          const answer = await this.processWithOpenRouter(question, scrapeResult.content, openRouterKey, options);
+          return {
+            success: true,
+            answer,
+            method: scrapeResult.method,
+            scrapeTime: scrapeResult.stats.totalTime,
+            processing: 'openrouter'
+          };
+        } catch (error) {
+          this.log('  ⚠️ OpenRouter API call failed, falling back...');
+        }
+      }
+      
+      if (openAIKey) {
+        try {
+          const answer = await this.processWithOpenAI(question, scrapeResult.content, openAIKey, options);
+          return {
+            success: true,
+            answer,
+            method: scrapeResult.method,
+            scrapeTime: scrapeResult.stats.totalTime,
+            processing: 'openai'
+          };
+        } catch (error) {
+          this.log('  ⚠️ OpenAI API call failed, falling back...');
+        }
+      }
+      
+      // If BNCA API key is provided, use the backend API
+      if (this.options.apiKey) {
+        try {
+          const response = await fetch(`${this.options.apiUrl || 'https://bnca-api.fly.dev'}/aireply`, {
+            method: 'POST',
+            headers: {
+              'x-api-key': this.options.apiKey,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ url, question })
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            return {
+              success: true,
+              answer: data.answer,
+              method: scrapeResult.method,
+              scrapeTime: scrapeResult.stats.totalTime,
+              processing: 'backend'
+            };
+          }
+        } catch (error) {
+          this.log('  ⚠️ Backend API call failed, using local AI processing');
+        }
+      }
+      
+      // Local AI processing fallback
+      const answer = this.processLocally(question, scrapeResult.content);
+      
+      return {
+        success: true,
+        answer,
+        method: scrapeResult.method,
+        scrapeTime: scrapeResult.stats.totalTime,
+        processing: 'local'
+      };
+      
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message || 'AI processing failed'
+      };
+    }
+  }
+  
+  /**
+   * Process with OpenRouter API
+   * @private
+   */
+  async processWithOpenRouter(question, content, apiKey, options = {}) {
+    const parsedContent = typeof content === 'string' ? JSON.parse(content) : content;
+    
+    const contentText = `
+Title: ${parsedContent.title || 'Unknown'}
+Content: ${parsedContent.content || parsedContent.bodyText || 'No content available'}
+Meta Description: ${parsedContent.metaDescription || 'None'}
+${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h => `- ${h.text || h}`).join('\n')}` : ''}
+`.trim();
+
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': options.referer || 'https://github.com/monostate/node-scraper',
+        'X-Title': 'BNCA Node Scraper',
+      },
+      body: JSON.stringify({
+        model: options.model || 'meta-llama/llama-4-scout:free',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a helpful assistant that answers questions based on website content. Provide accurate, concise answers based only on the provided content.'
+          },
+          {
+            role: 'user',
+            content: `Based on the following website content, please answer this question: ${question}\n\nWebsite content:\n${contentText}`
+          }
+        ],
+        temperature: options.temperature || 0.3,
+        max_tokens: options.maxTokens || 500,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`OpenRouter API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0]?.message?.content || 'No response from AI';
+  }
+
+  /**
+   * Process with OpenAI API
+   * @private
+   */
+  async processWithOpenAI(question, content, apiKey, options = {}) {
+    const parsedContent = typeof content === 'string' ? JSON.parse(content) : content;
+    
+    const contentText = `
+Title: ${parsedContent.title || 'Unknown'}
+Content: ${parsedContent.content || parsedContent.bodyText || 'No content available'}
+Meta Description: ${parsedContent.metaDescription || 'None'}
+${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h => `- ${h.text || h}`).join('\n')}` : ''}
+`.trim();
+
+    const baseUrl = options.openAIBaseUrl || 'https://api.openai.com';
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: options.model || 'gpt-3.5-turbo',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a helpful assistant that answers questions based on website content. Provide accurate, concise answers based only on the provided content.'
+          },
+          {
+            role: 'user',
+            content: `Based on the following website content, please answer this question: ${question}\n\nWebsite content:\n${contentText}`
+          }
+        ],
+        temperature: options.temperature || 0.3,
+        max_tokens: options.maxTokens || 500,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`OpenAI API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0]?.message?.content || 'No response from AI';
+  }
+
+  /**
+   * Local AI processing (simple pattern matching)
+   * @private
+   */
+  processLocally(question, content) {
+    const parsedContent = typeof content === 'string' ? 
+      JSON.parse(content) : content;
+      
+    const title = parsedContent.title || 'Unknown';
+    const text = parsedContent.content || parsedContent.bodyText || '';
+    const lowerQuestion = question.toLowerCase();
+    
+    if (lowerQuestion.includes('title')) {
+      return `The page title is "${title}".`;
+    }
+    
+    if (lowerQuestion.includes('about') || lowerQuestion.includes('what')) {
+      return `This page titled "${title}" contains: ${text.substring(0, 200)}...`;
+    }
+    
+    if (lowerQuestion.includes('contact') || lowerQuestion.includes('email')) {
+      const emailMatch = text.match(/[\w.-]+@[\w.-]+\.\w+/);
+      return emailMatch ? 
+        `Found contact: ${emailMatch[0]}` : 
+        'No contact information found.';
+    }
+    
+    return `Based on "${title}": ${text.substring(0, 150)}...`;
+  }
+  
+  /**
    * Main scraping method with intelligent fallback
    */
   async scrape(url, options = {}) {
@@ -1162,6 +1388,18 @@ export async function quickShot(url, options = {}) {
     return result;
   } catch (error) {
     throw error;
+  }
+}
+
+export async function askWebsiteAI(url, question, options = {}) {
+  const scraper = new BNCASmartScraper(options);
+  try {
+    const result = await scraper.askAI(url, question, options);
+    return result;
+  } catch (error) {
+    throw error;
+  } finally {
+    await scraper.cleanup();
   }
 }
 
