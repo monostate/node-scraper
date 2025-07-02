@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.1] - 2025-07-02
+
+### Fixed
+- Critical fix: Added browser-pool.js to npm package files
+- Added BULK_SCRAPING.md to npm package
+
 ## [1.8.0] - 2025-07-02
 
 ### Added
