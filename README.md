@@ -19,6 +19,8 @@ yarn add @monostate/node-scraper
 pnpm add @monostate/node-scraper
 ```
 
+**Fixed in v1.8.1**: Critical production fix - browser-pool.js now included in npm package.
+
 **New in v1.8.0**: Bulk scraping with automatic request queueing, progress tracking, and streaming results! Process hundreds of URLs efficiently. Plus critical memory leak fix with browser pooling.
 
 **Fixed in v1.7.0**: Critical cross-platform compatibility fix - binaries are now correctly downloaded per platform instead of being bundled.
