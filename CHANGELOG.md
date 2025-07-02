@@ -1,5 +1,50 @@
 # Changelog
 
+## [1.6.0] - 2025-07-02
+
+### Added
+- Method override parameter to force specific scraping methods (`method: 'direct' | 'lightpanda' | 'puppeteer' | 'auto'`)
+- Enhanced error handling with categorized error types (`network`, `timeout`, `parsing`, `service_unavailable`)
+- Fallback chain tracking in auto mode to show which methods were attempted
+- Detailed error messages for each scraping method failure
+
+### Improved
+- No automatic fallback when a specific method is forced - fails gracefully with descriptive errors
+- Better error categorization for debugging and monitoring
+- TypeScript definitions updated with new method parameter and error fields
+
+### Use Cases
+- Test specific scraping methods in isolation
+- Optimize performance for known site requirements
+- Debug method-specific issues
+- Enable Lightpanda team to test each method independently
+
+## [1.5.0] - 2025-06-15
+
+### Added
+- AI-powered Q&A functionality with `askAI()` method
+- Support for OpenRouter API integration
+- Support for OpenAI API and compatible endpoints (Groq, Together AI, etc.)
+- Local fallback AI processing when no API key is provided
+- Convenience function `askWebsiteAI()` for one-liner Q&A
+
+## [1.3.0] - 2025-06-10
+
+### Added
+- PDF parsing support with automatic detection
+- Smart PDF detection via URL patterns, content-type headers, and magic bytes
+- Text extraction, metadata parsing, and page count from PDFs
+- Handles PDFs served with incorrect content-types
+
+## [1.2.0] - 2025-06-05
+
+### Added
+- Auto-installation of Lightpanda binary during npm install
+- Cross-platform support with automatic OS detection
+- Improved binary detection and ES6 module compatibility
+- Better error handling with retry logic
+- Zero configuration setup
+
 ## [1.1.1] - 2025-01-18
 
 ### Fixed

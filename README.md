@@ -72,6 +72,40 @@ console.log(result.stats); // Performance statistics
 await scraper.cleanup(); // Clean up resources
 ```
 
+### Method Override (New in v1.6.0)
+
+Force a specific scraping method instead of using automatic fallback:
+
+```javascript
+// Force direct fetch (no browser)
+const result = await smartScrape('https://example.com', { method: 'direct' });
+
+// Force Lightpanda browser
+const result = await smartScrape('https://example.com', { method: 'lightpanda' });
+
+// Force Puppeteer (full Chrome)
+const result = await smartScrape('https://example.com', { method: 'puppeteer' });
+
+// Auto mode (default - intelligent fallback)
+const result = await smartScrape('https://example.com', { method: 'auto' });
+```
+
+**Important**: When forcing a method, no fallback occurs if it fails. This is useful for:
+- Testing specific methods in isolation
+- Optimizing for known site requirements
+- Debugging method-specific issues
+
+**Error Response for Forced Methods**:
+```javascript
+{
+  success: false,
+  error: "Lightpanda scraping failed: [specific error]",
+  method: "lightpanda",
+  errorType: "network|timeout|parsing|service_unavailable",
+  details: "Additional error context"
+}
+```
+
 ## 🔧 How It Works
 
 BNCA uses a sophisticated multi-tier system with intelligent detection:
@@ -462,32 +496,38 @@ const scraper: BNCASmartScraper = new BNCASmartScraper({
 const result: ScrapingResult = await scraper.scrape('https://example.com');
 ```
 
-## 📋 Changelog
+## Changelog
 
-### v1.5.0 (Latest)
-- 🤖 **AI-Powered Q&A**: Ask questions about any website and get AI-generated answers
-- 🌐 **OpenRouter Support**: Native integration with OpenRouter API for advanced AI models
-- 🧠 **OpenAI Support**: Compatible with OpenAI and OpenAI-compatible endpoints (Groq, Together AI, etc.)
-- 🔄 **Smart Fallback**: Automatic fallback chain: OpenRouter → OpenAI → Backend API → Local processing
-- 🎯 **One-liner AI**: New `askWebsiteAI()` convenience function for quick AI queries
-- 📘 **Enhanced TypeScript**: Complete type definitions for all AI features
+### v1.6.0 (Latest)
+- **Method Override**: Force specific scraping methods with `method` parameter
+- **Enhanced Error Handling**: Categorized error types for better debugging
+- **Fallback Chain Tracking**: See which methods were attempted in auto mode
+- **Graceful Failures**: No automatic fallback when method is forced
+
+### v1.5.0
+- **AI-Powered Q&A**: Ask questions about any website and get AI-generated answers
+- **OpenRouter Support**: Native integration with OpenRouter API for advanced AI models
+- **OpenAI Support**: Compatible with OpenAI and OpenAI-compatible endpoints (Groq, Together AI, etc.)
+- **Smart Fallback**: Automatic fallback chain: OpenRouter -> OpenAI -> Backend API -> Local processing
+- **One-liner AI**: New `askWebsiteAI()` convenience function for quick AI queries
+- **Enhanced TypeScript**: Complete type definitions for all AI features
 
 ### v1.4.0
 - Internal release (skipped for public release)
 
 ### v1.3.0
-- 📄 **PDF Support**: Full PDF parsing with text extraction, metadata, and page count
-- 🔍 **Smart PDF Detection**: Detects PDFs by URL patterns, content-type, or magic bytes
-- 🚀 **Robust Parsing**: Handles PDFs served with incorrect content-types (e.g., GitHub raw files)
-- ⚡ **Fast Performance**: PDF parsing typically completes in 100-500ms
-- 📊 **Comprehensive Extraction**: Title, author, creation date, page count, and full text
+- **PDF Support**: Full PDF parsing with text extraction, metadata, and page count
+- **Smart PDF Detection**: Detects PDFs by URL patterns, content-type, or magic bytes
+- **Robust Parsing**: Handles PDFs served with incorrect content-types (e.g., GitHub raw files)
+- **Fast Performance**: PDF parsing typically completes in 100-500ms
+- **Comprehensive Extraction**: Title, author, creation date, page count, and full text
 
 ### v1.2.0
-- 🎉 **Auto-Installation**: Lightpanda binary is now automatically downloaded during `npm install`
-- 🔧 **Cross-Platform Support**: Automatic detection and installation for macOS, Linux, and Windows/WSL
-- ⚡ **Improved Performance**: Enhanced binary detection and ES6 module compatibility
-- 🛠️ **Better Error Handling**: More robust installation scripts with retry logic
-- 📦 **Zero Configuration**: No manual setup required - works out of the box
+- **Auto-Installation**: Lightpanda binary is now automatically downloaded during `npm install`
+- **Cross-Platform Support**: Automatic detection and installation for macOS, Linux, and Windows/WSL
+- **Improved Performance**: Enhanced binary detection and ES6 module compatibility
+- **Better Error Handling**: More robust installation scripts with retry logic
+- **Zero Configuration**: No manual setup required - works out of the box
 
 ### v1.1.1
 - Bug fixes and stability improvements

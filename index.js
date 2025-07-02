@@ -286,6 +286,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     let result = null;
     let method = 'unknown';
     let lastError = null;
+    const fallbackChain = [];
+    
+    // Check if a specific method is requested
+    const requestedMethod = config.method;
+    const isForced = requestedMethod && requestedMethod !== 'auto';
     
     try {
       // Check if URL is a PDF (by extension or content-type check)
@@ -317,8 +322,74 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         }
       }
       
+      // Handle forced method requests
+      if (isForced) {
+        this.log(`  🎯 Method forced to: ${requestedMethod}`);
+        
+        switch (requestedMethod) {
+          case 'direct':
+            this.log('  🔄 Attempting direct fetch...');
+            result = await this.tryDirectFetch(url, config);
+            method = 'direct-fetch';
+            break;
+            
+          case 'lightpanda':
+            this.log('  🐼 Attempting Lightpanda...');
+            result = await this.tryLightpanda(url, config);
+            method = 'lightpanda';
+            break;
+            
+          case 'puppeteer':
+            this.log('  🔵 Attempting Puppeteer...');
+            result = await this.tryPuppeteer(url, config);
+            method = 'puppeteer';
+            break;
+            
+          default:
+            return {
+              success: false,
+              error: `Invalid method: ${requestedMethod}. Valid methods are: auto, direct, lightpanda, puppeteer`,
+              method: 'error',
+              errorType: 'service_unavailable',
+              performance: {
+                totalTime: Date.now() - startTime
+              }
+            };
+        }
+        
+        // For forced methods, return immediately with no fallback
+        if (!result.success) {
+          this.log(`  ❌ ${requestedMethod} failed`);
+          return {
+            success: false,
+            error: result.error || `${requestedMethod} scraping failed`,
+            method,
+            errorType: this.categorizeError(result.error),
+            details: result.error,
+            performance: {
+              totalTime: Date.now() - startTime,
+              method
+            },
+            stats: this.getStats()
+          };
+        }
+        
+        this.log(`  ✅ ${requestedMethod} successful`);
+        const totalTime = Date.now() - startTime;
+        return {
+          ...result,
+          method,
+          performance: {
+            totalTime,
+            method
+          },
+          stats: this.getStats()
+        };
+      }
+      
       // Step 1: Try direct fetch first (fastest)
       this.log('  🔄 Attempting direct fetch...');
+      fallbackChain.push('direct-fetch');
       result = await this.tryDirectFetch(url, config);
       
       if (result.success && !result.needsBrowser) {
@@ -353,6 +424,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         
         // Step 2: Try Lightpanda (fast browser)
         this.log('  🐼 Attempting Lightpanda...');
+        fallbackChain.push('lightpanda');
         result = await this.tryLightpanda(url, config);
         
         if (result.success) {
@@ -364,6 +436,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
           
           // Step 3: Fallback to Puppeteer (full browser)
           this.log('  🔵 Attempting Puppeteer...');
+          fallbackChain.push('puppeteer');
           result = await this.tryPuppeteer(url, config);
           
           if (result.success) {
@@ -386,7 +459,9 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
           totalTime,
           method
         },
-        stats: this.getStats()
+        stats: this.getStats(),
+        // Only include fallbackChain in auto mode
+        ...((!requestedMethod || requestedMethod === 'auto') && { fallbackChain })
       };
       
     } catch (error) {
@@ -428,7 +503,8 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       if (!response.ok) {
         return {
           success: false,
-          error: `HTTP ${response.status}: ${response.statusText}`
+          error: `Direct fetch failed: HTTP ${response.status}: ${response.statusText}`,
+          errorType: response.status === 404 ? 'service_unavailable' : 'network'
         };
       }
       
@@ -485,9 +561,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       }
       
     } catch (error) {
+      const errorMsg = error.message || 'Unknown error';
       return {
         success: false,
-        error: error.message
+        error: `Direct fetch failed: ${errorMsg}`,
+        errorType: this.categorizeError(errorMsg)
       };
     }
   }
@@ -501,7 +579,8 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     if (!this.options.lightpandaPath) {
       return {
         success: false,
-        error: 'Lightpanda binary not found. Please install Lightpanda or provide path.'
+        error: 'Lightpanda scraping failed: Lightpanda binary not found. Please install Lightpanda or provide path.',
+        errorType: 'service_unavailable'
       };
     }
     
@@ -511,13 +590,15 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       if (!stats.isFile()) {
         return {
           success: false,
-          error: 'Lightpanda binary is not a file'
+          error: 'Lightpanda scraping failed: Lightpanda binary is not a file',
+          errorType: 'service_unavailable'
         };
       }
     } catch {
       return {
         success: false,
-        error: 'Lightpanda binary not accessible'
+        error: 'Lightpanda scraping failed: Lightpanda binary not accessible',
+        errorType: 'service_unavailable'
       };
     }
     
@@ -551,9 +632,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
             exitCode: code
           });
         } else {
+          const errorMsg = errorOutput || `Lightpanda exited with code ${code}`;
           resolve({
             success: false,
-            error: errorOutput || `Lightpanda exited with code ${code}`,
+            error: `Lightpanda scraping failed: ${errorMsg}`,
+            errorType: this.categorizeError(errorMsg),
             exitCode: code
           });
         }
@@ -562,7 +645,8 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       process.on('error', (error) => {
         resolve({
           success: false,
-          error: `Lightpanda process error: ${error.message}`
+          error: `Lightpanda scraping failed: ${error.message}`,
+          errorType: this.categorizeError(error.message)
         });
       });
     });
@@ -575,7 +659,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     this.stats.puppeteer.attempts++;
     
     if (!puppeteer) {
-      throw new Error('Puppeteer is not available');
+      return {
+        success: false,
+        error: 'Puppeteer scraping failed: Puppeteer is not installed. Please install puppeteer package.',
+        errorType: 'service_unavailable'
+      };
     }
     
     try {
@@ -688,9 +776,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       };
       
     } catch (error) {
+      const errorMsg = error.message || 'Unknown error';
       return {
         success: false,
-        error: error.message
+        error: `Puppeteer scraping failed: ${errorMsg}`,
+        errorType: this.categorizeError(errorMsg)
       };
     }
   }
@@ -1032,6 +1122,27 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
           (this.stats.pdf.successes / this.stats.pdf.attempts * 100).toFixed(1) + '%' : '0%'
       }
     };
+  }
+  
+  /**
+   * Categorize error types for better error handling
+   */
+  categorizeError(errorMessage) {
+    if (!errorMessage) return 'unknown';
+    
+    const error = errorMessage.toLowerCase();
+    
+    if (error.includes('timeout') || error.includes('timed out') || error.includes('abort')) {
+      return 'timeout';
+    } else if (error.includes('network') || error.includes('enotfound') || error.includes('econnrefused') || error.includes('econnreset')) {
+      return 'network';
+    } else if (error.includes('parse') || error.includes('parsing') || error.includes('invalid')) {
+      return 'parsing';
+    } else if (error.includes('not found') || error.includes('404') || error.includes('unavailable')) {
+      return 'service_unavailable';
+    }
+    
+    return 'unknown';
   }
   
   /**

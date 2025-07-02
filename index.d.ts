@@ -3,6 +3,8 @@
 // Definitions by: BNCA Team
 
 export interface ScrapingOptions {
+  /** Scraping method to use: "auto" (default), "direct", "lightpanda", or "puppeteer" */
+  method?: 'auto' | 'direct' | 'lightpanda' | 'puppeteer';
   /** Request timeout in milliseconds */
   timeout?: number;
   /** Number of retries per method */
@@ -50,6 +52,10 @@ export interface ScrapingResult {
   contentType?: string;
   /** Error message if scraping failed */
   error?: string;
+  /** Error type for categorization */
+  errorType?: 'network' | 'timeout' | 'parsing' | 'service_unavailable';
+  /** Additional error details */
+  details?: string;
   /** Base64 encoded screenshot (if captured) */
   screenshot?: string;
   /** Performance metrics */
@@ -65,6 +71,8 @@ export interface ScrapingResult {
   browserIndicators?: string[];
   /** Performance statistics */
   stats?: ScrapingStats;
+  /** Methods attempted during auto mode (only populated in auto mode) */
+  fallbackChain?: string[];
 }
 
 export interface SystemMetrics {
