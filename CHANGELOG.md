@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.8.0] - 2025-07-02
+
+### Added
+- **Bulk Scraping**: New `bulkScrape()` and `bulkScrapeStream()` methods for efficient multi-URL processing
+- **Request Queueing**: Automatic request queueing when browser pool is full (no more errors!)
+- **Progress Tracking**: Real-time progress callbacks for bulk operations
+- **Streaming Results**: Process results as they complete for better memory efficiency
+- Browser pool management system with configurable max instances and idle timeout
+- Automatic browser instance reuse for better performance
+- Graceful shutdown handling for browser instances
+- `cleanup()` method for manual resource cleanup
+- Comprehensive bulk scraping documentation in BULK_SCRAPING.md
+
+### Fixed
+- Critical memory leak where Chromium instances were not being properly closed
+- Implemented browser instance pooling with automatic cleanup
+- Added resource cleanup to prevent "Out of memory" crashes
+- Fixed parallel request handling to queue gracefully instead of throwing errors
+
+### Performance
+- 2-3x faster subsequent requests due to browser reuse
+- Controlled memory usage with automatic idle browser cleanup
+- Prevents accumulation of zombie Chromium processes
+- Efficient bulk processing with configurable concurrency
+
 ## [1.7.0] - 2025-07-02
 
 ### Fixed

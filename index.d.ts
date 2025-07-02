@@ -139,6 +139,118 @@ export interface HealthCheckResult {
   timestamp: string;
 }
 
+export interface BulkScrapeOptions extends ScrapingOptions {
+  /** Number of concurrent requests (default: 5) */
+  concurrency?: number;
+  /** Progress callback function */
+  progressCallback?: (progress: BulkProgress) => void;
+  /** Continue processing on error (default: true) */
+  continueOnError?: boolean;
+}
+
+export interface BulkScrapeStreamOptions extends ScrapingOptions {
+  /** Number of concurrent requests (default: 5) */
+  concurrency?: number;
+  /** Callback for each successful result */
+  onResult: (result: BulkScrapeResultItem) => void | Promise<void>;
+  /** Callback for errors */
+  onError?: (error: BulkScrapeErrorItem) => void | Promise<void>;
+  /** Progress callback function */
+  progressCallback?: (progress: BulkProgress) => void;
+}
+
+export interface BulkProgress {
+  /** Number of URLs processed */
+  processed: number;
+  /** Total number of URLs */
+  total: number;
+  /** Percentage complete */
+  percentage: number;
+  /** Current URL being processed */
+  current: string;
+}
+
+export interface BulkScrapeResult {
+  /** Successfully scraped results */
+  success: BulkScrapeResultItem[];
+  /** Failed scrapes */
+  failed: BulkScrapeErrorItem[];
+  /** Total number of URLs */
+  total: number;
+  /** Start timestamp */
+  startTime: number;
+  /** End timestamp */
+  endTime: number;
+  /** Aggregate statistics */
+  stats: BulkScrapeStats;
+}
+
+export interface BulkScrapeResultItem extends ScrapingResult {
+  /** The URL that was scraped */
+  url: string;
+  /** Time taken in milliseconds */
+  duration: number;
+  /** Timestamp of completion */
+  timestamp: string;
+}
+
+export interface BulkScrapeErrorItem {
+  /** The URL that failed */
+  url: string;
+  /** Success is always false for errors */
+  success: false;
+  /** Error message */
+  error: string;
+  /** Time taken in milliseconds */
+  duration: number;
+  /** Timestamp of failure */
+  timestamp: string;
+}
+
+export interface BulkScrapeStats {
+  /** Number of successful scrapes */
+  successful: number;
+  /** Number of failed scrapes */
+  failed: number;
+  /** Total time taken in milliseconds */
+  totalTime: number;
+  /** Average time per URL in milliseconds */
+  averageTime: number;
+  /** Count of methods used */
+  methods: {
+    direct: number;
+    lightpanda: number;
+    puppeteer: number;
+    pdf: number;
+  };
+}
+
+export interface BulkScrapeStreamStats {
+  /** Total number of URLs */
+  total: number;
+  /** Number of URLs processed */
+  processed: number;
+  /** Number of successful scrapes */
+  successful: number;
+  /** Number of failed scrapes */
+  failed: number;
+  /** Start timestamp */
+  startTime: number;
+  /** End timestamp */
+  endTime: number;
+  /** Total time in milliseconds */
+  totalTime: number;
+  /** Average time per URL in milliseconds */
+  averageTime: number;
+  /** Count of methods used */
+  methods: {
+    direct: number;
+    lightpanda: number;
+    puppeteer: number;
+    pdf: number;
+  };
+}
+
 /**
  * BNCA Smart Scraper - Intelligent web scraping with multi-level fallback
  */
@@ -264,6 +376,27 @@ export class BNCASmartScraper {
    * @param message Message to log
    */
   private log(message: string): void;
+  
+  /**
+   * Clean up resources - closes all browser instances
+   */
+  cleanup(): Promise<void>;
+  
+  /**
+   * Bulk scrape multiple URLs with optimized concurrency
+   * @param urls Array of URLs to scrape
+   * @param options Bulk scraping options
+   * @returns Promise resolving to bulk scraping results
+   */
+  bulkScrape(urls: string[], options?: BulkScrapeOptions): Promise<BulkScrapeResult>;
+  
+  /**
+   * Bulk scrape with streaming results
+   * @param urls Array of URLs to scrape
+   * @param options Bulk scraping options with callbacks
+   * @returns Promise resolving to summary statistics
+   */
+  bulkScrapeStream(urls: string[], options: BulkScrapeStreamOptions): Promise<BulkScrapeStreamStats>;
 }
 
 /**
@@ -305,6 +438,22 @@ export function askWebsiteAI(url: string, question: string, options?: ScrapingOp
   scrapeTime?: number;
   processing?: 'openrouter' | 'openai' | 'backend' | 'local';
 }>;
+
+/**
+ * Convenience function for bulk scraping multiple URLs
+ * @param urls Array of URLs to scrape
+ * @param options Bulk scraping options
+ * @returns Promise resolving to bulk scraping results
+ */
+export function bulkScrape(urls: string[], options?: BulkScrapeOptions): Promise<BulkScrapeResult>;
+
+/**
+ * Convenience function for bulk scraping with streaming results
+ * @param urls Array of URLs to scrape
+ * @param options Bulk scraping options with callbacks
+ * @returns Promise resolving to summary statistics
+ */
+export function bulkScrapeStream(urls: string[], options: BulkScrapeStreamOptions): Promise<BulkScrapeStreamStats>;
 
 /**
  * Default export - same as BNCASmartScraper class

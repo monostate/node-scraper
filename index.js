@@ -6,6 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fsPromises } from 'fs';
 import pdfParse from 'pdf-parse/lib/pdf-parse.js';
+import browserPool from './browser-pool.js';
 
 let puppeteer = null;
 try {
@@ -666,23 +667,13 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       };
     }
     
+    let browser = null;
+    let page = null;
+    
     try {
-      if (!this.browser) {
-        this.browser = await puppeteer.launch({
-          headless: true,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu'
-          ]
-        });
-      }
-      
-      const page = await this.browser.newPage();
+      // Get browser from pool
+      browser = await browserPool.getBrowser();
+      page = await browser.newPage();
       
       // Set user agent and viewport
       await page.setUserAgent(config.userAgent);
@@ -766,7 +757,6 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         };
       });
       
-      await page.close();
       this.stats.puppeteer.successes++;
       
       return {
@@ -782,6 +772,26 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         error: `Puppeteer scraping failed: ${errorMsg}`,
         errorType: this.categorizeError(errorMsg)
       };
+    } finally {
+      // Always clean up page
+      if (page) {
+        try {
+          // Check if page is still connected before closing
+          if (!page.isClosed()) {
+            await page.close();
+          }
+        } catch (e) {
+          // Silently ignore protocol errors when page is already closed
+          if (!e.message.includes('Protocol error') && !e.message.includes('Target closed')) {
+            console.warn('Error closing page:', e.message);
+          }
+        }
+      }
+      
+      // Release browser back to pool
+      if (browser) {
+        browserPool.releaseBrowser(browser);
+      }
     }
   }
   
@@ -1467,6 +1477,235 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       timestamp: new Date().toISOString()
     };
   }
+  
+  /**
+   * Clean up resources - closes all browser instances
+   */
+  async cleanup() {
+    await browserPool.closeAll();
+  }
+  
+  /**
+   * Bulk scrape multiple URLs with optimized concurrency
+   * @param {string[]} urls - Array of URLs to scrape
+   * @param {Object} options - Scraping options
+   * @returns {Promise<Object>} Bulk scraping results
+   */
+  async bulkScrape(urls, options = {}) {
+    const {
+      concurrency = 5,
+      progressCallback = null,
+      continueOnError = true,
+      ...scrapeOptions
+    } = options;
+    
+    const results = {
+      success: [],
+      failed: [],
+      total: urls.length,
+      startTime: Date.now(),
+      endTime: null,
+      stats: {
+        successful: 0,
+        failed: 0,
+        totalTime: 0,
+        averageTime: 0,
+        methods: {
+          direct: 0,
+          lightpanda: 0,
+          puppeteer: 0,
+          pdf: 0
+        }
+      }
+    };
+    
+    // Process URLs in batches
+    const batches = [];
+    for (let i = 0; i < urls.length; i += concurrency) {
+      batches.push(urls.slice(i, i + concurrency));
+    }
+    
+    let processedCount = 0;
+    
+    for (const batch of batches) {
+      const batchPromises = batch.map(async (url) => {
+        const startTime = Date.now();
+        try {
+          const result = await this.scrape(url, scrapeOptions);
+          const endTime = Date.now();
+          const duration = endTime - startTime;
+          
+          const successResult = {
+            url,
+            ...result,
+            duration,
+            timestamp: new Date(endTime).toISOString()
+          };
+          
+          results.success.push(successResult);
+          results.stats.successful++;
+          
+          // Track method usage
+          if (result.method) {
+            results.stats.methods[result.method]++;
+          }
+          
+          return successResult;
+        } catch (error) {
+          const endTime = Date.now();
+          const duration = endTime - startTime;
+          
+          const failedResult = {
+            url,
+            success: false,
+            error: error.message,
+            duration,
+            timestamp: new Date(endTime).toISOString()
+          };
+          
+          results.failed.push(failedResult);
+          results.stats.failed++;
+          
+          if (!continueOnError) {
+            throw error;
+          }
+          
+          return failedResult;
+        } finally {
+          processedCount++;
+          if (progressCallback) {
+            progressCallback({
+              processed: processedCount,
+              total: urls.length,
+              percentage: (processedCount / urls.length) * 100,
+              current: url
+            });
+          }
+        }
+      });
+      
+      await Promise.all(batchPromises);
+    }
+    
+    results.endTime = Date.now();
+    results.stats.totalTime = results.endTime - results.startTime;
+    results.stats.averageTime = results.stats.totalTime / urls.length;
+    
+    return results;
+  }
+  
+  /**
+   * Bulk scrape with streaming results
+   * @param {string[]} urls - Array of URLs to scrape
+   * @param {Object} options - Scraping options with onResult callback
+   * @returns {Promise<Object>} Summary statistics
+   */
+  async bulkScrapeStream(urls, options = {}) {
+    const {
+      concurrency = 5,
+      onResult = null,
+      onError = null,
+      progressCallback = null,
+      ...scrapeOptions
+    } = options;
+    
+    if (!onResult) {
+      throw new Error('onResult callback is required for streaming bulk scrape');
+    }
+    
+    const stats = {
+      total: urls.length,
+      processed: 0,
+      successful: 0,
+      failed: 0,
+      startTime: Date.now(),
+      endTime: null,
+      methods: {
+        direct: 0,
+        lightpanda: 0,
+        puppeteer: 0,
+        pdf: 0
+      }
+    };
+    
+    const queue = [...urls];
+    const inProgress = new Set();
+    
+    const processNext = async () => {
+      if (queue.length === 0 || inProgress.size >= concurrency) {
+        return;
+      }
+      
+      const url = queue.shift();
+      inProgress.add(url);
+      
+      const startTime = Date.now();
+      try {
+        const result = await this.scrape(url, scrapeOptions);
+        const duration = Date.now() - startTime;
+        
+        stats.successful++;
+        if (result.method) {
+          stats.methods[result.method]++;
+        }
+        
+        await onResult({
+          url,
+          ...result,
+          duration,
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        const duration = Date.now() - startTime;
+        stats.failed++;
+        
+        if (onError) {
+          await onError({
+            url,
+            error: error.message,
+            duration,
+            timestamp: new Date().toISOString()
+          });
+        }
+      } finally {
+        inProgress.delete(url);
+        stats.processed++;
+        
+        if (progressCallback) {
+          progressCallback({
+            processed: stats.processed,
+            total: stats.total,
+            percentage: (stats.processed / stats.total) * 100,
+            current: url
+          });
+        }
+        
+        // Process next URL
+        if (queue.length > 0) {
+          processNext();
+        }
+      }
+    };
+    
+    // Start initial batch
+    const initialBatch = Math.min(concurrency, queue.length);
+    const promises = [];
+    for (let i = 0; i < initialBatch; i++) {
+      promises.push(processNext());
+    }
+    
+    // Wait for all to complete
+    await Promise.all(promises);
+    while (inProgress.size > 0) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    stats.endTime = Date.now();
+    stats.totalTime = stats.endTime - stats.startTime;
+    stats.averageTime = stats.totalTime / stats.total;
+    
+    return stats;
+  }
 }
 
 // Export convenience functions
@@ -1506,6 +1745,30 @@ export async function askWebsiteAI(url, question, options = {}) {
   const scraper = new BNCASmartScraper(options);
   try {
     const result = await scraper.askAI(url, question, options);
+    return result;
+  } catch (error) {
+    throw error;
+  } finally {
+    await scraper.cleanup();
+  }
+}
+
+export async function bulkScrape(urls, options = {}) {
+  const scraper = new BNCASmartScraper(options);
+  try {
+    const result = await scraper.bulkScrape(urls, options);
+    return result;
+  } catch (error) {
+    throw error;
+  } finally {
+    await scraper.cleanup();
+  }
+}
+
+export async function bulkScrapeStream(urls, options = {}) {
+  const scraper = new BNCASmartScraper(options);
+  try {
+    const result = await scraper.bulkScrapeStream(urls, options);
     return result;
   } catch (error) {
     throw error;

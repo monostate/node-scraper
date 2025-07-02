@@ -19,6 +19,8 @@ yarn add @monostate/node-scraper
 pnpm add @monostate/node-scraper
 ```
 
+**New in v1.8.0**: Bulk scraping with automatic request queueing, progress tracking, and streaming results! Process hundreds of URLs efficiently. Plus critical memory leak fix with browser pooling.
+
 **Fixed in v1.7.0**: Critical cross-platform compatibility fix - binaries are now correctly downloaded per platform instead of being bundled.
 
 **New in v1.6.0**: Method override support! Force specific scraping methods with `method` parameter for testing and optimization.
@@ -76,6 +78,24 @@ console.log(result.stats); // Performance statistics
 await scraper.cleanup(); // Clean up resources
 ```
 
+### Browser Pool Configuration (New in v1.8.0)
+
+The package now includes automatic browser instance pooling to prevent memory leaks:
+
+```javascript
+// Browser pool is managed automatically with these defaults:
+// - Max 3 concurrent browser instances
+// - 5 second idle timeout before cleanup
+// - Automatic reuse of browser instances
+
+// For heavy workloads, you can manually clean up:
+const scraper = new BNCASmartScraper();
+// ... perform multiple scrapes ...
+await scraper.cleanup(); // Closes all browser instances
+```
+
+**Important**: The convenience functions (`smartScrape`, `smartScreenshot`, etc.) automatically handle cleanup. You only need to call `cleanup()` when using the `BNCASmartScraper` class directly.
+
 ### Method Override (New in v1.6.0)
 
 Force a specific scraping method instead of using automatic fallback:
@@ -109,6 +129,68 @@ const result = await smartScrape('https://example.com', { method: 'auto' });
   details: "Additional error context"
 }
 ```
+
+### Bulk Scraping (New in v1.8.0)
+
+Process multiple URLs efficiently with automatic request queueing and progress tracking:
+
+```javascript
+import { bulkScrape } from '@monostate/node-scraper';
+
+// Basic bulk scraping
+const urls = [
+  'https://example1.com',
+  'https://example2.com',
+  'https://example3.com',
+  // ... hundreds more
+];
+
+const results = await bulkScrape(urls, {
+  concurrency: 5,  // Process 5 URLs at a time
+  continueOnError: true,  // Don't stop on failures
+  progressCallback: (progress) => {
+    console.log(`Progress: ${progress.percentage.toFixed(1)}% (${progress.processed}/${progress.total})`);
+  }
+});
+
+console.log(`Success: ${results.stats.successful}, Failed: ${results.stats.failed}`);
+console.log(`Total time: ${results.stats.totalTime}ms`);
+console.log(`Average time per URL: ${results.stats.averageTime}ms`);
+```
+
+#### Streaming Results
+
+For large datasets, use streaming to process results as they complete:
+
+```javascript
+import { bulkScrapeStream } from '@monostate/node-scraper';
+
+await bulkScrapeStream(urls, {
+  concurrency: 10,
+  onResult: async (result) => {
+    // Process each successful result immediately
+    await saveToDatabase(result);
+    console.log(`✓ ${result.url} - ${result.duration}ms`);
+  },
+  onError: async (error) => {
+    // Handle errors as they occur
+    console.error(`✗ ${error.url} - ${error.error}`);
+  },
+  progressCallback: (progress) => {
+    process.stdout.write(`\rProcessing: ${progress.percentage.toFixed(1)}%`);
+  }
+});
+```
+
+**Features:**
+- Automatic request queueing (no more memory errors!)
+- Configurable concurrency control
+- Real-time progress tracking
+- Continue on error or stop on first failure
+- Detailed statistics and method tracking
+- Browser instance pooling for efficiency
+
+For detailed examples and advanced usage, see [BULK_SCRAPING.md](./BULK_SCRAPING.md).
 
 ## How It Works
 
