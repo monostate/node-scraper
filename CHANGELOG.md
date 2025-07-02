@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.0] - 2025-07-02
+
+### Fixed
+- Critical bug where platform-specific binaries were being bundled in npm package
+- Removed `bin/` directory from package.json files array to ensure fresh binary downloads per platform
+- Fixed Linux deployment failures caused by bundled macOS binaries
+
+### Impact
+- Resolves "cannot execute binary file: Exec format error" on Linux systems
+- Ensures correct platform-specific Lightpanda binary is downloaded during installation
+- Prevents cross-platform binary compatibility issues
+
 ## [1.6.0] - 2025-07-02
 
 ### Added

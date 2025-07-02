@@ -1,6 +1,6 @@
 {
   "name": "@monostate/node-scraper",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Intelligent web scraping with AI Q&A, PDF support and multi-level fallback system - 11x faster than traditional scrapers",
   "type": "module",
   "main": "index.js",
@@ -16,8 +16,7 @@
     "index.d.ts",
     "README.md",
     "package.json",
-    "scripts/",
-    "bin/"
+    "scripts/"
   ],
   "scripts": {
     "postinstall": "node scripts/install-lightpanda.js"

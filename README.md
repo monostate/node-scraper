@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 [![Node](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/)
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
@@ -19,18 +19,22 @@ yarn add @monostate/node-scraper
 pnpm add @monostate/node-scraper
 ```
 
-**🤖 New in v1.5.0**: AI-powered Q&A! Ask questions about any website using OpenRouter, OpenAI, or built-in AI. (Note: v1.4.0 was an internal release)
+**Fixed in v1.7.0**: Critical cross-platform compatibility fix - binaries are now correctly downloaded per platform instead of being bundled.
 
-**🎉 Also in v1.3.0**: PDF parsing support added! Automatically extracts text, metadata, and page count from PDF documents.
+**New in v1.6.0**: Method override support! Force specific scraping methods with `method` parameter for testing and optimization.
 
-**✨ Also in v1.2.0**: Lightpanda binary is now automatically downloaded and configured during installation! No manual setup required.
+**New in v1.5.0**: AI-powered Q&A! Ask questions about any website using OpenRouter, OpenAI, or built-in AI.
+
+**Also in v1.3.0**: PDF parsing support added! Automatically extracts text, metadata, and page count from PDF documents.
+
+**Also in v1.2.0**: Lightpanda binary is now automatically downloaded and configured during installation! No manual setup required.
 
 ### Zero-Configuration Setup
 
 The package now automatically:
-- 📦 Downloads the correct Lightpanda binary for your platform (macOS, Linux, Windows/WSL)
-- 🔧 Configures binary paths and permissions
-- ✅ Validates installation health on first use
+- Downloads the correct Lightpanda binary for your platform (macOS, Linux, Windows/WSL)
+- Configures binary paths and permissions
+- Validates installation health on first use
 
 ### Basic Usage
 
@@ -106,7 +110,7 @@ const result = await smartScrape('https://example.com', { method: 'auto' });
 }
 ```
 
-## 🔧 How It Works
+## How It Works
 
 BNCA uses a sophisticated multi-tier system with intelligent detection:
 
@@ -235,7 +239,7 @@ Clean up resources (close browser instances).
 await scraper.cleanup();
 ```
 
-### 🤖 AI-Powered Q&A
+### AI-Powered Q&A
 
 Ask questions about any website and get AI-generated answers:
 
