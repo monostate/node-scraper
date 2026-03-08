@@ -6,17 +6,30 @@ import path from 'path';
 import { createWriteStream } from 'fs';
 import { execSync } from 'child_process';
 
-const LIGHTPANDA_VERSION = 'nightly';
+const LIGHTPANDA_VERSION = 'v0.2.5';
 const BINARY_DIR = path.join(path.dirname(path.dirname(new URL(import.meta.url).pathname)), 'bin');
 const BINARY_NAME = 'lightpanda';
 const BINARY_PATH = path.join(BINARY_DIR, BINARY_NAME);
 
-// Platform-specific download URLs (matching official Lightpanda instructions)
-const DOWNLOAD_URLS = {
-  'darwin': `https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_VERSION}/lightpanda-aarch64-macos`,
-  'linux': `https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_VERSION}/lightpanda-x86_64-linux`,
-  'wsl': `https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_VERSION}/lightpanda-x86_64-linux` // WSL uses Linux binary
-};
+function detectArch() {
+  const arch = process.arch;
+  if (arch === 'arm64' || arch === 'aarch64') return 'aarch64';
+  if (arch === 'x64' || arch === 'x86_64') return 'x86_64';
+  return arch;
+}
+
+// Platform-specific download URLs (matching official Lightpanda releases)
+function getDownloadUrls() {
+  const arch = detectArch();
+  const base = `https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_VERSION}`;
+  return {
+    'darwin': `${base}/lightpanda-${arch}-macos`,
+    'linux': `${base}/lightpanda-${arch}-linux`,
+    'wsl': `${base}/lightpanda-x86_64-linux`
+  };
+}
+
+const DOWNLOAD_URLS = getDownloadUrls();
 
 function detectPlatform() {
   const platform = process.platform;

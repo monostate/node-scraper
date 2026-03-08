@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.0.0] - 2026-03-07
+
+### Breaking Changes
+- **Node.js 20+ required** — dropped support for Node 18
+- **Removed `node-fetch` dependency** — uses built-in `fetch` (Node 20+)
+- **`pdf-parse` upgraded to v2** — new class-based API under the hood (public API unchanged)
+
+### Updated
+- **LightPanda v0.2.5** — upgraded from nightly to stable release with new CLI flags (`--dump html|markdown`, `--with_frames`, `--http_timeout`)
+- **Puppeteer peer dep** — bumped to `^24.38.0`, `headless: true` replaces deprecated `headless: 'new'`
+- **Install script** — architecture-aware binary downloads (aarch64/x86_64) for macOS and Linux
+
+### Fixed
+- `__NEXT_DATA__` / `__INITIAL_STATE__` extraction regex was broken (produced 4 trailing underscores, never matched)
+- LightPanda now uses `--with_frames` for iframe content and `--http_timeout` for proper timeout control
+
+### Added
+- Comprehensive test suite (78 tests) covering fallback chain, browser detection, PDF parsing, screenshots, content extraction, and real-site integration
+- LightPanda markdown output mode via `lightpandaFormat: 'markdown'` option
+
 ## [1.8.1] - 2025-07-02
 
 ### Fixed

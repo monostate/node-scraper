@@ -1,11 +1,10 @@
-import fetch from 'node-fetch';
 import { spawn, execSync } from 'child_process';
 import fs from 'fs/promises';
 import { existsSync, statSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fsPromises } from 'fs';
-import pdfParse from 'pdf-parse/lib/pdf-parse.js';
+import { PDFParse } from 'pdf-parse';
 import browserPool from './browser-pool.js';
 
 let puppeteer = null;
@@ -604,27 +603,41 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     }
     
     return new Promise((resolve) => {
-      const args = ['fetch', '--dump', url];
+      const format = config.lightpandaFormat || 'html';
+      const args = [
+        'fetch',
+        '--dump', format,
+        '--with_frames',
+        '--http_timeout', String(config.timeout),
+        url
+      ];
       const process = spawn(this.options.lightpandaPath, args, {
-        timeout: config.timeout + 1000 // Add buffer for process timeout only
+        timeout: config.timeout + 2000 // Buffer above http_timeout
       });
-      
+
       let output = '';
       let errorOutput = '';
-      
+
       process.stdout.on('data', (data) => {
         output += data.toString();
       });
-      
+
       process.stderr.on('data', (data) => {
         errorOutput += data.toString();
       });
-      
+
       process.on('close', (code) => {
         if (code === 0 && output.length > 0) {
-          const content = this.extractContentFromHTML(output);
+          // Markdown output is already clean text, no HTML extraction needed
+          const content = format === 'markdown'
+            ? JSON.stringify({
+                title: output.match(/^#\s+(.+)$/m)?.[1] || '',
+                content: output,
+                extractedAt: new Date().toISOString()
+              }, null, 2)
+            : this.extractContentFromHTML(output);
           this.stats.lightpanda.successes++;
-          
+
           resolve({
             success: true,
             content,
@@ -642,7 +655,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
           });
         }
       });
-      
+
       process.on('error', (error) => {
         resolve({
           success: false,
@@ -847,25 +860,30 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         };
       }
       
-      // Parse PDF
-      const pdfData = await pdfParse(buffer);
-      
+      // Parse PDF with pdf-parse v2 API
+      const parser = new PDFParse({ data: new Uint8Array(buffer) });
+      await parser.load();
+      const textResult = await parser.getText();
+      const infoResult = await parser.getInfo();
+      parser.destroy();
+
       // Extract structured content
+      const pdfInfo = infoResult.info || {};
       const content = {
-        title: pdfData.info?.Title || 'Untitled PDF',
-        author: pdfData.info?.Author || '',
-        subject: pdfData.info?.Subject || '',
-        keywords: pdfData.info?.Keywords || '',
-        creator: pdfData.info?.Creator || '',
-        producer: pdfData.info?.Producer || '',
-        creationDate: pdfData.info?.CreationDate || '',
-        modificationDate: pdfData.info?.ModificationDate || '',
-        pages: pdfData.numpages || 0,
-        text: pdfData.text || '',
-        metadata: pdfData.metadata || null,
+        title: pdfInfo.Title || infoResult.outline?.[0]?.title || 'Untitled PDF',
+        author: pdfInfo.Author || '',
+        subject: pdfInfo.Subject || '',
+        keywords: pdfInfo.Keywords || '',
+        creator: pdfInfo.Creator || '',
+        producer: pdfInfo.Producer || '',
+        creationDate: pdfInfo.CreationDate || '',
+        modificationDate: pdfInfo.ModDate || '',
+        pages: textResult.total || 0,
+        text: textResult.text || '',
+        metadata: infoResult.metadata || null,
         url: url
       };
-      
+
       this.stats.pdf.successes++;
       
       return {
@@ -1008,11 +1026,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       });
       
       // Extract window state data
-      const windowDataMatch = html.match(/window\.__(?:INITIAL_STATE__|INITIAL_DATA__|NEXT_DATA__)__\s*=\s*({[\s\S]*?});/);
+      const windowDataMatch = html.match(/window\.__(INITIAL_STATE|INITIAL_DATA|NEXT_DATA)__\s*=\s*({[\s\S]*?});/);
       let windowData = null;
       if (windowDataMatch) {
         try {
-          windowData = JSON.parse(windowDataMatch[1]);
+          windowData = JSON.parse(windowDataMatch[2]);
         } catch {
           windowData = 'Found but unparseable';
         }
