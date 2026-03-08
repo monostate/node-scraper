@@ -455,6 +455,103 @@ export function bulkScrape(urls: string[], options?: BulkScrapeOptions): Promise
  */
 export function bulkScrapeStream(urls: string[], options: BulkScrapeStreamOptions): Promise<BulkScrapeStreamStats>;
 
+// ── Browser Session ───────────────────────────────────────────
+
+export interface BrowserSessionOptions {
+  mode?: 'headless' | 'visual' | 'auto';
+  timeout?: number;
+  userAgent?: string;
+  lightpandaPath?: string;
+  verbose?: boolean;
+}
+
+export interface PageState {
+  url: string;
+  title: string;
+  text: string;
+  interactiveElements: Array<{
+    type: 'button' | 'link' | 'input' | 'select';
+    text?: string;
+    label?: string;
+    href?: string;
+    selector: string;
+    tag?: string;
+    inputType?: string;
+    value?: string;
+  }>;
+  screenshot?: string;
+  backend: 'lightpanda' | 'chrome';
+  sessionHistory: Array<{ type: string; timestamp: number; backend: string }>;
+}
+
+export interface ActionResult {
+  success: boolean;
+  url?: string;
+  screenshot?: string;
+  backend?: string;
+}
+
+export interface BrowserAction {
+  type: 'goto' | 'click' | 'type' | 'scroll' | 'hover' | 'select' | 'pressKey' | 'goBack' | 'goForward' | 'screenshot' | 'extractContent' | 'waitFor';
+  url?: string;
+  selector?: string;
+  text?: string;
+  key?: string;
+  direction?: 'up' | 'down';
+  amount?: number;
+  values?: string[];
+  timeout?: number;
+  expectNavigation?: boolean;
+  waitForNavigation?: boolean;
+  clear?: boolean;
+  delay?: number;
+  fullPage?: boolean;
+  type_?: 'png' | 'jpeg' | 'webp';
+  includeScreenshot?: boolean;
+}
+
+export declare class BrowserSession {
+  constructor(options?: BrowserSessionOptions);
+
+  readonly activeBackend: 'lightpanda' | 'chrome' | null;
+  readonly mode: 'headless' | 'visual' | 'auto';
+
+  connect(): Promise<BrowserSession>;
+  goto(url: string): Promise<ActionResult>;
+  goBack(): Promise<void>;
+  goForward(): Promise<void>;
+  click(selector: string, options?: { timeout?: number; expectNavigation?: boolean; waitForNavigation?: boolean }): Promise<ActionResult>;
+  type(selector: string, text: string, options?: { timeout?: number; clear?: boolean; delay?: number }): Promise<ActionResult>;
+  scroll(direction?: 'up' | 'down', amount?: number): Promise<ActionResult>;
+  hover(selector: string): Promise<ActionResult>;
+  select(selector: string, ...values: string[]): Promise<ActionResult>;
+  pressKey(key: string): Promise<ActionResult>;
+  screenshot(options?: { type?: 'png' | 'jpeg' | 'webp'; fullPage?: boolean }): Promise<{ success: boolean; screenshot: string; backend: string }>;
+  extractContent(): Promise<{ title: string; metaDescription: string; headings: any[]; paragraphs: string[]; links: any[]; bodyText: string; url: string }>;
+  evaluate<T>(fn: (...args: any[]) => T, ...args: any[]): Promise<T>;
+  waitFor(selector: string, timeout?: number): Promise<ActionResult>;
+  getPageState(options?: { includeScreenshot?: boolean }): Promise<PageState>;
+  executeAction(action: BrowserAction): Promise<ActionResult>;
+  getCookies(): Promise<any[]>;
+  setCookies(cookies: any[]): Promise<void>;
+  getHistory(): Array<{ type: string; timestamp: number; backend: string }>;
+  getBackend(): 'lightpanda' | 'chrome' | null;
+  close(): Promise<void>;
+}
+
+export function createSession(options?: BrowserSessionOptions): Promise<BrowserSession>;
+
+export declare class LightPandaServer {
+  constructor(binaryPath?: string);
+  start(port?: number): Promise<string>;
+  getEndpoint(): string;
+  isRunning(): boolean;
+  stop(): void;
+}
+
+export function getLightPandaServer(binaryPath?: string): LightPandaServer;
+export function stopLightPandaServer(): void;
+
 /**
  * Default export - same as BNCASmartScraper class
  */

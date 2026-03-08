@@ -1795,4 +1795,8 @@ export async function bulkScrapeStream(urls, options = {}) {
   }
 }
 
+// Browser session exports
+export { BrowserSession, createSession } from './browser-session.js';
+export { default as LightPandaServer, getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
+
 export default BNCASmartScraper;
