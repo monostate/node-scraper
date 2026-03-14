@@ -79,6 +79,80 @@ await bulkScrapeStream(urls, {
 
 See [BULK_SCRAPING.md](./BULK_SCRAPING.md) for full documentation.
 
+### Browser sessions
+
+Persistent browser sessions with real-time control. Three modes:
+
+```javascript
+import { createSession } from '@monostate/node-scraper';
+
+// Headless (default) — LightPanda with Chrome fallback
+const session = await createSession({ mode: 'auto' });
+await session.goto('https://example.com');
+const content = await session.extractContent();
+const state = await session.getPageState({ includeScreenshot: true });
+await session.close();
+
+// Visual — Chrome with headless:false for dev/debug
+const visual = await createSession({ mode: 'visual' });
+await visual.goto('https://example.com');
+await visual.screenshot(); // real Chrome rendering
+await visual.close();
+```
+
+Session methods: `goto`, `click`, `type`, `scroll`, `hover`, `select`, `pressKey`, `goBack`, `goForward`, `screenshot`, `extractContent`, `getPageState`, `waitFor`, `evaluate`, `getCookies`, `setCookies`.
+
+### Computer use (coordinate-based browser control)
+
+For AI agents that navigate by pixel coordinates -- useful for anti-bot sites, dynamic UIs, or anything that can't be scraped with selectors.
+
+```javascript
+import { createSession, LocalProvider } from '@monostate/node-scraper';
+
+// LocalProvider runs Xvfb + Chrome + xdotool (Linux only)
+const session = await createSession({
+  mode: 'computer-use',
+  provider: new LocalProvider({ screenWidth: 1280, screenHeight: 800, enableVnc: true }),
+});
+
+await session.goto('https://example.com');
+
+// Coordinate-based actions (delegated to provider)
+await session.clickAt(640, 400);
+await session.typeText('hello world');
+await session.mouseMove(100, 200);
+await session.drag(10, 20, 300, 400);
+await session.scrollAt(640, 400, 'down', 5);
+const pos = await session.getCursorPosition();
+const size = await session.getScreenSize();
+
+// Selector-based actions still work (via Puppeteer CDP)
+await session.click('#submit');
+await session.type('#search', 'query');
+
+// VNC streaming URL (if provider supports it)
+console.log(session.getVncUrl());
+
+await session.close();
+```
+
+#### Custom providers
+
+Implement `ComputerUseProvider` to connect any VM/container backend:
+
+```javascript
+import { ComputerUseProvider } from '@monostate/node-scraper';
+
+class MyProvider extends ComputerUseProvider {
+  async start() {
+    // Provision VM, return { cdpUrl, vncUrl, screenSize }
+  }
+  async mouseClick(x, y, button) { /* ... */ }
+  async screenshot() { /* ... */ }
+  async stop() { /* cleanup */ }
+}
+```
+
 ### AI-powered Q&A
 
 Ask questions about any website using OpenRouter, OpenAI, or local fallback:

@@ -455,14 +455,57 @@ export function bulkScrape(urls: string[], options?: BulkScrapeOptions): Promise
  */
 export function bulkScrapeStream(urls: string[], options: BulkScrapeStreamOptions): Promise<BulkScrapeStreamStats>;
 
+// ── Computer Use Provider ─────────────────────────────────────
+
+export interface ProviderInfo {
+  cdpUrl: string;
+  vncUrl: string | null;
+  screenSize: { width: number; height: number };
+}
+
+export interface CoordinateActionResult {
+  success: boolean;
+  screenshot?: string | null;
+  error?: string | null;
+}
+
+export declare class ComputerUseProvider {
+  start(): Promise<ProviderInfo>;
+  stop(): Promise<void>;
+  screenshot(): Promise<{ screenshot: string }>;
+  mouseMove(x: number, y: number): Promise<CoordinateActionResult>;
+  mouseClick(x: number, y: number, button?: 'left' | 'right' | 'middle'): Promise<CoordinateActionResult>;
+  mouseDoubleClick(x: number, y: number, button?: 'left' | 'right' | 'middle'): Promise<CoordinateActionResult>;
+  mouseDrag(startX: number, startY: number, endX: number, endY: number): Promise<CoordinateActionResult>;
+  scroll(x: number, y: number, direction: 'up' | 'down', amount?: number): Promise<CoordinateActionResult>;
+  pressKey(key: string): Promise<CoordinateActionResult>;
+  typeText(text: string): Promise<CoordinateActionResult>;
+  wait(ms: number): Promise<CoordinateActionResult>;
+  getCursorPosition(): Promise<{ x: number; y: number }>;
+  getScreenSize(): Promise<{ width: number; height: number }>;
+}
+
+export interface LocalProviderOptions {
+  screenWidth?: number;
+  screenHeight?: number;
+  enableVnc?: boolean;
+  chromePath?: string;
+  chromeArgs?: string[];
+}
+
+export declare class LocalProvider extends ComputerUseProvider {
+  constructor(options?: LocalProviderOptions);
+}
+
 // ── Browser Session ───────────────────────────────────────────
 
 export interface BrowserSessionOptions {
-  mode?: 'headless' | 'visual' | 'auto';
+  mode?: 'headless' | 'visual' | 'auto' | 'computer-use';
   timeout?: number;
   userAgent?: string;
   lightpandaPath?: string;
   verbose?: boolean;
+  provider?: ComputerUseProvider;
 }
 
 export interface PageState {
@@ -480,7 +523,7 @@ export interface PageState {
     value?: string;
   }>;
   screenshot?: string;
-  backend: 'lightpanda' | 'chrome';
+  backend: 'lightpanda' | 'chrome' | 'computer-use';
   sessionHistory: Array<{ type: string; timestamp: number; backend: string }>;
 }
 
@@ -492,7 +535,7 @@ export interface ActionResult {
 }
 
 export interface BrowserAction {
-  type: 'goto' | 'click' | 'type' | 'scroll' | 'hover' | 'select' | 'pressKey' | 'goBack' | 'goForward' | 'screenshot' | 'extractContent' | 'waitFor';
+  type: 'goto' | 'click' | 'type' | 'scroll' | 'hover' | 'select' | 'pressKey' | 'goBack' | 'goForward' | 'screenshot' | 'extractContent' | 'waitFor' | 'mouseMove' | 'clickAt' | 'doubleClickAt' | 'drag' | 'scrollAt' | 'typeText' | 'getCursorPosition' | 'getScreenSize';
   url?: string;
   selector?: string;
   text?: string;
@@ -508,13 +551,21 @@ export interface BrowserAction {
   fullPage?: boolean;
   type_?: 'png' | 'jpeg' | 'webp';
   includeScreenshot?: boolean;
+  /** Coordinate-based action fields */
+  x?: number;
+  y?: number;
+  button?: 'left' | 'right' | 'middle';
+  startX?: number;
+  startY?: number;
+  endX?: number;
+  endY?: number;
 }
 
 export declare class BrowserSession {
   constructor(options?: BrowserSessionOptions);
 
-  readonly activeBackend: 'lightpanda' | 'chrome' | null;
-  readonly mode: 'headless' | 'visual' | 'auto';
+  readonly activeBackend: 'lightpanda' | 'chrome' | 'computer-use' | null;
+  readonly mode: 'headless' | 'visual' | 'auto' | 'computer-use';
 
   connect(): Promise<BrowserSession>;
   goto(url: string): Promise<ActionResult>;
@@ -535,8 +586,19 @@ export declare class BrowserSession {
   getCookies(): Promise<any[]>;
   setCookies(cookies: any[]): Promise<void>;
   getHistory(): Array<{ type: string; timestamp: number; backend: string }>;
-  getBackend(): 'lightpanda' | 'chrome' | null;
+  getBackend(): 'lightpanda' | 'chrome' | 'computer-use' | null;
   close(): Promise<void>;
+
+  /** Coordinate-based actions (computer-use mode only) */
+  mouseMove(x: number, y: number): Promise<CoordinateActionResult>;
+  clickAt(x: number, y: number, button?: 'left' | 'right' | 'middle'): Promise<CoordinateActionResult>;
+  doubleClickAt(x: number, y: number, button?: 'left' | 'right' | 'middle'): Promise<CoordinateActionResult>;
+  drag(startX: number, startY: number, endX: number, endY: number): Promise<CoordinateActionResult>;
+  scrollAt(x: number, y: number, direction: 'up' | 'down', amount?: number): Promise<CoordinateActionResult>;
+  typeText(text: string): Promise<CoordinateActionResult>;
+  getCursorPosition(): Promise<{ x: number; y: number }>;
+  getScreenSize(): Promise<{ width: number; height: number }>;
+  getVncUrl(): string | null;
 }
 
 export function createSession(options?: BrowserSessionOptions): Promise<BrowserSession>;

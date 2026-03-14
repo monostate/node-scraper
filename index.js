@@ -4,7 +4,7 @@ import { existsSync, statSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fsPromises } from 'fs';
-import { PDFParse } from 'pdf-parse';
+let PDFParse = null;
 import browserPool from './browser-pool.js';
 
 let puppeteer = null;
@@ -860,7 +860,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         };
       }
       
-      // Parse PDF with pdf-parse v2 API
+      // Lazy-load pdf-parse (pdfjs-dist requires DOMMatrix, only available in Node 22+)
+      if (!PDFParse) {
+        const mod = await import('pdf-parse');
+        PDFParse = mod.PDFParse;
+      }
       const parser = new PDFParse({ data: new Uint8Array(buffer) });
       await parser.load();
       const textResult = await parser.getText();
@@ -1798,5 +1802,7 @@ export async function bulkScrapeStream(urls, options = {}) {
 // Browser session exports
 export { BrowserSession, createSession } from './browser-session.js';
 export { default as LightPandaServer, getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
+export { ComputerUseProvider } from './computer-use-provider.js';
+export { LocalProvider } from './providers/local-provider.js';
 
 export default BNCASmartScraper;

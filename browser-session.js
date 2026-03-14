@@ -12,15 +12,16 @@ const FALLBACK_REASONS = {
 export class BrowserSession {
   /**
    * @param {object} options
-   * @param {'headless'|'visual'|'auto'} options.mode - 'headless' (LightPanda), 'visual' (Chrome), 'auto' (LP with Chrome fallback)
+   * @param {'headless'|'visual'|'auto'|'computer-use'} options.mode - 'headless' (LightPanda), 'visual' (Chrome visible), 'auto' (LP with Chrome fallback), 'computer-use' (provider with Xvfb+VNC)
    * @param {number} options.timeout - Navigation timeout in ms (default: 15000)
    * @param {string} options.userAgent - Custom user agent
    * @param {string} options.lightpandaPath - Path to LightPanda binary
    * @param {boolean} options.verbose - Enable logging
+   * @param {import('./computer-use-provider.js').ComputerUseProvider} options.provider - Required for computer-use mode
    */
   constructor(options = {}) {
     this.mode = options.mode || 'auto';
-    this.activeBackend = null; // 'lightpanda' | 'chrome'
+    this.activeBackend = null; // 'lightpanda' | 'chrome' | 'computer-use'
     this.timeout = options.timeout || 15000;
     this.userAgent = options.userAgent || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
     this.lightpandaPath = options.lightpandaPath;
@@ -33,6 +34,10 @@ export class BrowserSession {
     this._connected = false;
     this._fallbackCount = 0;
 
+    // Computer-use provider (Xvfb + Chrome + xdotool + optional VNC)
+    this.provider = options.provider || null;
+    this._providerInfo = null;
+
     this.history = []; // action log for debugging
   }
 
@@ -41,8 +46,10 @@ export class BrowserSession {
   async connect() {
     if (this._connected) return this;
 
-    if (this.mode === 'visual') {
-      await this._connectChrome();
+    if (this.mode === 'computer-use') {
+      await this._connectViaProvider();
+    } else if (this.mode === 'visual') {
+      await this._connectChromeVisual();
     } else {
       // 'headless' or 'auto' — start with LightPanda
       try {
@@ -84,6 +91,45 @@ export class BrowserSession {
     await this.page.setViewport({ width: 1280, height: 800 });
     this.activeBackend = 'chrome';
     this._log('Connected to Chrome');
+  }
+
+  async _connectChromeVisual() {
+    const puppeteer = await this._getPuppeteer();
+    this.browser = await puppeteer.launch({
+      headless: false,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--window-size=1280,800',
+      ],
+    });
+    this.page = await this.browser.newPage();
+    await this.page.setUserAgent(this.userAgent);
+    await this.page.setViewport({ width: 1280, height: 800 });
+    this.activeBackend = 'chrome';
+    this._log('Connected to Chrome (visual, headless:false)');
+  }
+
+  async _connectViaProvider() {
+    if (!this.provider) {
+      throw new Error('computer-use mode requires a provider. Pass { provider: new LocalProvider() }');
+    }
+    this._providerInfo = await this.provider.start();
+
+    const puppeteer = await this._getPuppeteer();
+    this.browser = await puppeteer.connect({
+      browserWSEndpoint: this._providerInfo.cdpUrl,
+    });
+
+    const pages = await this.browser.pages();
+    this.page = pages[0] || await this.browser.newPage();
+    await this.page.setViewport({
+      width: this._providerInfo.screenSize.width,
+      height: this._providerInfo.screenSize.height,
+    });
+    this.activeBackend = 'computer-use';
+    this._log('Connected via ComputerUseProvider');
   }
 
   // ── Navigation ──────────────────────────────────────────────
@@ -383,6 +429,15 @@ export class BrowserSession {
       case 'screenshot': return this.screenshot(action);
       case 'extractContent': return this.extractContent();
       case 'waitFor': return this.waitFor(action.selector, action.timeout);
+      // Coordinate-based actions (computer-use mode)
+      case 'mouseMove': return this.mouseMove(action.x, action.y);
+      case 'clickAt': return this.clickAt(action.x, action.y, action.button);
+      case 'doubleClickAt': return this.doubleClickAt(action.x, action.y, action.button);
+      case 'drag': return this.drag(action.startX, action.startY, action.endX, action.endY);
+      case 'scrollAt': return this.scrollAt(action.x, action.y, action.direction, action.amount);
+      case 'typeText': return this.typeText(action.text);
+      case 'getCursorPosition': return this.getCursorPosition();
+      case 'getScreenSize': return this.getScreenSize();
       default: throw new Error(`Unknown action type: ${action.type}`);
     }
   }
@@ -414,6 +469,86 @@ export class BrowserSession {
     } else {
       await this.page.setCookie(...cookies);
     }
+  }
+
+  // ── Coordinate-based actions (computer-use mode) ────────────
+
+  _ensureProvider() {
+    if (!this.provider || this.activeBackend !== 'computer-use') {
+      throw new Error('Coordinate-based actions require computer-use mode with a provider');
+    }
+  }
+
+  async mouseMove(x, y) {
+    this._ensureConnected();
+    this._ensureProvider();
+    const result = await this.provider.mouseMove(x, y);
+    this._logAction('mouseMove', { x, y });
+    return result;
+  }
+
+  async clickAt(x, y, button = 'left') {
+    this._ensureConnected();
+    this._ensureProvider();
+    const result = await this.provider.mouseClick(x, y, button);
+    this._logAction('clickAt', { x, y, button });
+    return result;
+  }
+
+  async doubleClickAt(x, y, button = 'left') {
+    this._ensureConnected();
+    this._ensureProvider();
+    const result = await this.provider.mouseDoubleClick(x, y, button);
+    this._logAction('doubleClickAt', { x, y, button });
+    return result;
+  }
+
+  async drag(startX, startY, endX, endY) {
+    this._ensureConnected();
+    this._ensureProvider();
+    const result = await this.provider.mouseDrag(startX, startY, endX, endY);
+    this._logAction('drag', { startX, startY, endX, endY });
+    return result;
+  }
+
+  async scrollAt(x, y, direction = 'down', amount = 3) {
+    this._ensureConnected();
+    this._ensureProvider();
+    const result = await this.provider.scroll(x, y, direction, amount);
+    this._logAction('scrollAt', { x, y, direction, amount });
+    return result;
+  }
+
+  async typeText(text) {
+    this._ensureConnected();
+    // Use Puppeteer keyboard when we have a page — works with both selector
+    // clicks (CDP focus) and coordinate clicks (X11 focus propagates to DOM).
+    // xdotool typeText only reaches the X11-focused window, not the DOM-focused
+    // element, so it fails when mixed with selector-based click.
+    if (this.page) {
+      await this.page.keyboard.type(text);
+    } else {
+      this._ensureProvider();
+      await this.provider.typeText(text);
+    }
+    this._logAction('typeText', { text: text.substring(0, 20) + (text.length > 20 ? '...' : '') });
+    return { success: true };
+  }
+
+  async getCursorPosition() {
+    this._ensureConnected();
+    this._ensureProvider();
+    return this.provider.getCursorPosition();
+  }
+
+  async getScreenSize() {
+    this._ensureConnected();
+    this._ensureProvider();
+    return this.provider.getScreenSize();
+  }
+
+  getVncUrl() {
+    return this._providerInfo?.vncUrl || null;
   }
 
   // ── Fallback ────────────────────────────────────────────────
@@ -487,8 +622,15 @@ export class BrowserSession {
       if (this.context) await this.context.close();
     } catch { /* ignore */ }
 
-    if (this.activeBackend === 'lightpanda' && this.browser) {
+    if (this.activeBackend === 'computer-use') {
+      // Provider mode: disconnect from CDP, then stop the provider
+      try { if (this.browser) await this.browser.disconnect(); } catch { /* ignore */ }
+      try { if (this.provider) await this.provider.stop(); } catch { /* ignore */ }
+    } else if (this.activeBackend === 'lightpanda' && this.browser) {
       try { await this.browser.disconnect(); } catch { /* ignore */ }
+    } else if (this.mode === 'visual' && this.browser && !this._chromeBrowser) {
+      // Visual mode: launched directly, not from pool — close the browser process
+      try { await this.browser.close(); } catch { /* ignore */ }
     }
 
     if (this._chromeBrowser) {
