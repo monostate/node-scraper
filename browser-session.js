@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { makeTempDir, removeDir } from './process-util.js';
 import { getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
 import browserPool, { buildLaunchArgs } from './browser-pool.js';
 import { redactUrl, SENSITIVE_FIELD_RE } from './redact.js';
@@ -54,6 +57,7 @@ export class BrowserSession extends EventEmitter {
    * @param {number} [options.maxStateText=3000] - Default text budget for getPageState()
    * @param {number} [options.maxStateElements=50] - Default element budget for getPageState()
    * @param {object|Function} [options.dialogHandler] - { action:'accept'|'dismiss', promptText? } or async (dialog) => decision; default dismisses
+   * @param {number} [options.maxUploadBytes=52428800] - Upper bound for the total size of one uploadFile() call
    * @param {number} options.timeout - Navigation timeout in ms (default: 15000)
    * @param {string} options.userAgent - Custom user agent
    * @param {string} options.lightpandaPath - Path to LightPanda binary
@@ -82,6 +86,13 @@ export class BrowserSession extends EventEmitter {
     this._dialogHandler = options.dialogHandler || null;
     this._dialogs = [];
     this._attachedPages = new WeakSet();
+    this.maxUploadBytes = options.maxUploadBytes ?? 50 * 1024 * 1024;
+    this._uploadDir = null;        // temp dir for buffer uploads (removed on close)
+    this._downloads = [];          // download records
+    this._downloadDir = null;
+    this._downloadClient = null;   // browser-level CDP session for download events
+    this._downloadWaiters = [];
+    this._maxDownloadBytes = null;
     this._activeFrame = null;      // Frame selected with useFrame(), null = main frame
     this._pages = [];              // pages this session owns (initial + popups)
     this._targetListener = null;
@@ -698,6 +709,7 @@ export class BrowserSession extends EventEmitter {
       case 'screenshot': return this.screenshot(action);
       case 'extractContent': return this.extractContent();
       case 'waitFor': return this.waitFor(action.selector, action.timeout);
+      case 'uploadFile': return this.uploadFile(action.selector, action.files, action);
       // Coordinate-based actions (computer-use mode)
       case 'mouseMove': return this.mouseMove(action.x, action.y);
       case 'clickAt': return this.clickAt(action.x, action.y, action.button);
@@ -709,6 +721,215 @@ export class BrowserSession extends EventEmitter {
       case 'getScreenSize': return this.getScreenSize();
       default: throw new Error(`Unknown action type: ${action.type}`);
     }
+  }
+
+  // ── Files: upload and download ──────────────────────────────
+
+  /**
+   * Turn path strings and { name, data, mimeType } buffers into on-disk paths
+   * for the browser, enforcing maxUploadBytes.
+   */
+  async _materializeFiles(files) {
+    const list = Array.isArray(files) ? files : [files];
+    const paths = [];
+    const meta = [];
+    let total = 0;
+    const check = () => {
+      if (total > this.maxUploadBytes) throw new Error(`upload exceeds maxUploadBytes (${this.maxUploadBytes} bytes)`);
+    };
+    for (const f of list) {
+      if (typeof f === 'string') {
+        const st = await fs.stat(f);
+        total += st.size; check();
+        paths.push(path.resolve(f));
+        meta.push({ name: path.basename(f), size: st.size, mimeType: null });
+      } else if (f && f.data != null) {
+        const buf = Buffer.isBuffer(f.data) ? f.data : Buffer.from(f.data);
+        total += buf.length; check();
+        if (!this._uploadDir) this._uploadDir = await makeTempDir('bnca-upload-');
+        const name = path.basename(String(f.name || `upload-${Date.now()}`));
+        const p = path.join(this._uploadDir, name);
+        await fs.writeFile(p, buf);
+        paths.push(p);
+        meta.push({ name, size: buf.length, mimeType: f.mimeType || null });
+      } else {
+        throw new Error('uploadFile: each file must be an absolute path string or { name, data, mimeType }');
+      }
+    }
+    return { paths, meta };
+  }
+
+  /**
+   * Attach files to an <input type=file> and verify the attachment.
+   * @param {string} selector
+   * @param {Array<string|{ name: string, data: Buffer|Uint8Array, mimeType?: string }>} files
+   * @param {{ timeout?: number }} [opts]
+   */
+  async uploadFile(selector, files, { timeout } = {}) {
+    this._ensureConnected();
+    const { paths, meta } = await this._materializeFiles(files);
+    const target = this._stateTarget();
+    const handle = await target.waitForSelector(selector, { timeout: timeout || this.timeout });
+    let dispatched = false;
+    try {
+      dispatched = true;
+      await handle.uploadFile(...paths);
+      const attached = await handle.evaluate((el) => Array.from(el.files || []).map(f => f.name));
+      const missing = meta.filter(m => !attached.includes(m.name)).map(m => m.name);
+      if (missing.length > 0) {
+        const uncertainReason = `attachment_not_verified:${missing.join(',')}`;
+        this._logAction('uploadFile', { selector, outcome: 'uncertain', uncertainReason });
+        return { success: false, outcome: 'uncertain', uncertainReason, files: meta, attached };
+      }
+      this._logAction('uploadFile', { selector, files: meta.map(m => m.name) });
+      return { success: true, outcome: 'ok', files: meta, attached };
+    } catch (err) {
+      if (dispatched) {
+        const uncertainReason = `error_after_dispatch:${err.message}`;
+        this._logAction('uploadFile', { selector, outcome: 'uncertain', uncertainReason });
+        return { success: false, outcome: 'uncertain', uncertainReason, error: err.message, files: meta };
+      }
+      throw err;
+    } finally {
+      await handle.dispose().catch(() => {});
+    }
+  }
+
+  /**
+   * Intercept the next native file picker. Await it *before* the click that
+   * opens the picker (Promise.all pattern).
+   * @param {{ timeout?: number }} [opts]
+   * @returns {Promise<{ isMultiple: boolean, accept(files): Promise<void>, cancel(): Promise<void> }>}
+   */
+  async waitForFileChooser({ timeout } = {}) {
+    this._ensureConnected();
+    const chooser = await this.page.waitForFileChooser({ timeout: timeout || this.timeout });
+    return {
+      isMultiple: chooser.isMultiple(),
+      accept: async (files) => {
+        const { paths, meta } = await this._materializeFiles(files);
+        await chooser.accept(paths);
+        this._logAction('fileChooser', { action: 'accept', files: meta.map(m => m.name) });
+      },
+      cancel: async () => {
+        await chooser.cancel();
+        this._logAction('fileChooser', { action: 'cancel' });
+      },
+    };
+  }
+
+  /**
+   * Route downloads to `dir` and start tracking them.
+   * @param {{ dir: string, maxBytes?: number }} opts
+   */
+  async enableDownloads({ dir, maxBytes = 100 * 1024 * 1024 } = {}) {
+    this._ensureConnected();
+    if (!dir) throw new Error('enableDownloads requires { dir }');
+    await fs.mkdir(dir, { recursive: true });
+    this._downloadDir = path.resolve(dir);
+    this._maxDownloadBytes = maxBytes;
+
+    if (!this._downloadClient) {
+      const client = await this.browser.target().createCDPSession();
+      this._downloadClient = client;
+      client.on('Browser.downloadWillBegin', (ev) => {
+        const rec = {
+          id: ev.guid,
+          url: ev.url,
+          suggestedFilename: ev.suggestedFilename || 'download',
+          path: null,
+          state: 'inProgress',
+          receivedBytes: 0,
+          totalBytes: null,
+          startedAt: Date.now(),
+        };
+        this._downloads.push(rec);
+        this._logAction('download', { url: ev.url, state: 'inProgress' });
+      });
+      client.on('Browser.downloadProgress', async (ev) => {
+        const rec = this._downloads.find(d => d.id === ev.guid);
+        if (!rec) return;
+        rec.receivedBytes = ev.receivedBytes;
+        rec.totalBytes = ev.totalBytes || rec.totalBytes;
+        if (ev.state === 'inProgress' && this._maxDownloadBytes && ev.receivedBytes > this._maxDownloadBytes) {
+          try { await client.send('Browser.cancelDownload', { guid: ev.guid, ...(this.context?.id ? { browserContextId: this.context.id } : {}) }); } catch { /* ignore */ }
+          rec.state = 'canceled';
+          rec.error = `exceeded maxBytes (${this._maxDownloadBytes})`;
+          this._settleDownload(rec);
+          return;
+        }
+        if (ev.state === 'completed') {
+          try {
+            rec.path = await this._placeDownload(path.join(this._downloadDir, ev.guid), rec.suggestedFilename);
+          } catch (err) {
+            rec.error = err.message;
+          }
+          rec.state = 'completed';
+          this._logAction('download', { url: rec.url, state: 'completed', bytes: rec.receivedBytes });
+          this._settleDownload(rec);
+        } else if (ev.state === 'canceled') {
+          rec.state = 'canceled';
+          this._settleDownload(rec);
+        }
+      });
+    }
+
+    await this._downloadClient.send('Browser.setDownloadBehavior', {
+      behavior: 'allowAndName',
+      downloadPath: this._downloadDir,
+      eventsEnabled: true,
+      ...(this.context?.id ? { browserContextId: this.context.id } : {}),
+    });
+    return { dir: this._downloadDir };
+  }
+
+  /** Rename the guid-named file to its suggested name, numbering on collision. */
+  async _placeDownload(from, suggested) {
+    const safe = path.basename(suggested).replace(/[\\/\0]/g, '_') || 'download';
+    const ext = path.extname(safe);
+    const base = safe.slice(0, safe.length - ext.length);
+    for (let i = 0; i < 1000; i++) {
+      const candidate = path.join(this._downloadDir, i === 0 ? safe : `${base} (${i})${ext}`);
+      try {
+        await fs.access(candidate);
+        continue; // exists
+      } catch {
+        await fs.rename(from, candidate);
+        return candidate;
+      }
+    }
+    return from;
+  }
+
+  _settleDownload(rec) {
+    const waiters = this._downloadWaiters.splice(0);
+    for (const w of waiters) {
+      clearTimeout(w.timer);
+      if (rec.state === 'completed') w.resolve({ ...rec });
+      else w.reject(new Error(`download ${rec.state}${rec.error ? `: ${rec.error}` : ''}`));
+    }
+  }
+
+  /** Download records so far (copies). */
+  downloads() {
+    return this._downloads.map(d => ({ ...d }));
+  }
+
+  /**
+   * Resolve with the next completed download (call before triggering it).
+   * @param {{ timeout?: number }} [opts]
+   */
+  waitForDownload({ timeout = this.timeout } = {}) {
+    this._ensureConnected();
+    if (!this._downloadClient) return Promise.reject(new Error('call enableDownloads({ dir }) first'));
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        this._downloadWaiters = this._downloadWaiters.filter(w => w !== waiter);
+        reject(new Error(`timed out after ${timeout}ms waiting for a download`));
+      }, timeout);
+      this._downloadWaiters.push(waiter);
+    });
   }
 
   // ── Cookies ─────────────────────────────────────────────────
@@ -1056,6 +1277,15 @@ export class BrowserSession extends EventEmitter {
 
   async close() {
     this._untrackPages();
+    for (const w of this._downloadWaiters.splice(0)) { clearTimeout(w.timer); w.reject(new Error('session closed')); }
+    if (this._downloadClient) {
+      try { await this._downloadClient.detach(); } catch { /* ignore */ }
+      this._downloadClient = null;
+    }
+    if (this._uploadDir) {
+      await removeDir(this._uploadDir).catch(() => {});
+      this._uploadDir = null;
+    }
     for (const p of this._pages) {
       try { if (!p.isClosed()) await p.close(); } catch { /* ignore */ }
     }
