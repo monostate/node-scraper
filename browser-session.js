@@ -6,6 +6,10 @@ import { getLightPandaServer, stopLightPandaServer } from './lightpanda-server.j
 import browserPool, { buildLaunchArgs } from './browser-pool.js';
 import { redactUrl, SENSITIVE_FIELD_RE } from './redact.js';
 import { collectPageState, DEFAULT_REF_ATTR } from './page-state.js';
+import { normalizeXdoKey } from './keymap.js';
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 
 const FALLBACK_REASONS = {
   SCREENSHOT: 'screenshot_requested',
@@ -93,6 +97,7 @@ export class BrowserSession extends EventEmitter {
     this._downloadClient = null;   // browser-level CDP session for download events
     this._downloadWaiters = [];
     this._maxDownloadBytes = null;
+    this._geometry = null;         // page<->desktop coordinate transform (computer-use)
     this._activeFrame = null;      // Frame selected with useFrame(), null = main frame
     this._pages = [];              // pages this session owns (initial + popups)
     this._targetListener = null;
@@ -553,8 +558,32 @@ export class BrowserSession extends EventEmitter {
 
   // ── Screenshot ──────────────────────────────────────────────
 
+  /**
+   * @param {{ space?: 'desktop'|'page', fullPage?: boolean, type_?: 'png'|'jpeg'|'webp' }} [options]
+   *   space defaults to 'desktop' in computer-use mode (what mouse coordinates
+   *   address) and 'page' otherwise. The result says which one it is.
+   */
   async screenshot(options = {}) {
     this._ensureConnected();
+    const space = options.space || (this.activeBackend === 'computer-use' ? 'desktop' : 'page');
+
+    if (space === 'desktop') {
+      if (this.activeBackend !== 'computer-use') {
+        throw new Error("screenshot({ space: 'desktop' }) requires computer-use mode with a provider");
+      }
+      const shot = await this.provider.screenshot({ space: 'desktop' });
+      this._logAction('screenshot', { space: 'desktop' });
+      return {
+        success: true,
+        screenshot: shot.screenshot,
+        backend: this.activeBackend,
+        coordinateSpace: shot.coordinateSpace || 'desktop',
+        width: shot.width ?? this._providerInfo?.screenSize?.width ?? null,
+        height: shot.height ?? this._providerInfo?.screenSize?.height ?? null,
+        dpr: shot.dpr ?? 1,
+        offset: { x: 0, y: 0 },
+      };
+    }
 
     // LightPanda can't screenshot — auto-fallback
     if (this.activeBackend === 'lightpanda') {
@@ -566,17 +595,25 @@ export class BrowserSession extends EventEmitter {
 
     // type_ avoids collision with executeAction's { type: 'screenshot' }
     const imageFormat = options.type_ || (options.type !== 'screenshot' && options.type) || 'png';
-    const buffer = await this.page.screenshot({
-      type: imageFormat,
-      fullPage: options.fullPage ?? true,
-      encoding: 'base64',
-    });
+    const fullPage = options.fullPage ?? true;
+    const buffer = await this.page.screenshot({ type: imageFormat, fullPage, encoding: 'base64' });
+    const dims = await this.page.evaluate((full) => ({
+      width: full ? Math.max(document.documentElement.scrollWidth, window.innerWidth) : window.innerWidth,
+      height: full ? Math.max(document.documentElement.scrollHeight, window.innerHeight) : window.innerHeight,
+      dpr: window.devicePixelRatio || 1,
+    }), fullPage).catch(() => ({ width: null, height: null, dpr: 1 }));
+    const offset = this.activeBackend === 'computer-use' ? (await this.getGeometry()).offset : { x: 0, y: 0 };
 
-    this._logAction('screenshot');
+    this._logAction('screenshot', { space: 'page' });
     return {
       success: true,
       screenshot: `data:image/${imageFormat};base64,${buffer}`,
       backend: this.activeBackend,
+      coordinateSpace: 'page',
+      width: dims.width,
+      height: dims.height,
+      dpr: dims.dpr,
+      offset,
     };
   }
 
@@ -710,13 +747,17 @@ export class BrowserSession extends EventEmitter {
       case 'extractContent': return this.extractContent();
       case 'waitFor': return this.waitFor(action.selector, action.timeout);
       case 'uploadFile': return this.uploadFile(action.selector, action.files, action);
-      // Coordinate-based actions (computer-use mode)
-      case 'mouseMove': return this.mouseMove(action.x, action.y);
-      case 'clickAt': return this.clickAt(action.x, action.y, action.button);
-      case 'doubleClickAt': return this.doubleClickAt(action.x, action.y, action.button);
-      case 'drag': return this.drag(action.startX, action.startY, action.endX, action.endY);
-      case 'scrollAt': return this.scrollAt(action.x, action.y, action.direction, action.amount);
+      // Coordinate-based actions (computer-use mode); { space: 'page'|'desktop' }
+      case 'mouseMove': return this.mouseMove(action.x, action.y, { space: action.space });
+      case 'clickAt': return this.clickAt(action.x, action.y, { button: action.button, space: action.space });
+      case 'doubleClickAt': return this.doubleClickAt(action.x, action.y, { button: action.button, space: action.space });
+      case 'drag': return this.drag(action.startX, action.startY, action.endX, action.endY, { space: action.space, steps: action.steps, stepDelayMs: action.stepDelayMs });
+      case 'scrollAt': return this.scrollAt(action.x, action.y, action.direction, action.amount, { space: action.space });
       case 'typeText': return this.typeText(action.text);
+      case 'desktopKey': return this.desktopKey(action.key);
+      case 'desktopType': return this.desktopType(action.text);
+      case 'calibrate': return this.calibrate(action);
+      case 'getGeometry': return this.getGeometry();
       case 'getCursorPosition': return this.getCursorPosition();
       case 'getScreenSize': return this.getScreenSize();
       default: throw new Error(`Unknown action type: ${action.type}`);
@@ -962,6 +1003,11 @@ export class BrowserSession extends EventEmitter {
   }
 
   // ── Coordinate-based actions (computer-use mode) ────────────
+  //
+  // Two coordinate spaces exist: 'page' (CSS pixels relative to the viewport,
+  // what page screenshots and getPageState().bounds use) and 'desktop' (pixels
+  // on the virtual display, what the provider's mouse addresses). Every
+  // coordinate action accepts { space } and converts through getGeometry().
 
   _ensureProvider() {
     if (!this.provider || this.activeBackend !== 'computer-use') {
@@ -969,60 +1015,209 @@ export class BrowserSession extends EventEmitter {
     }
   }
 
-  async mouseMove(x, y) {
+  /**
+   * Current page<->desktop transform. Measured from window bounds unless
+   * calibrate() has produced a more precise, event-based offset.
+   * @returns {Promise<{ screen: {width,height}, viewport: {width,height}, dpr: number, offset: {x,y}, method: 'calibrated'|'window-bounds'|'assumed-zero' }>}
+   */
+  async getGeometry() {
     this._ensureConnected();
-    this._ensureProvider();
-    const result = await this.provider.mouseMove(x, y);
-    this._logAction('mouseMove', { x, y });
-    return result;
+    if (this._geometry) return this._geometry;
+    this._geometry = await this._measureGeometry();
+    return this._geometry;
   }
 
-  async clickAt(x, y, button = 'left') {
-    this._ensureConnected();
-    this._ensureProvider();
-    const result = await this.provider.mouseClick(x, y, button);
-    this._logAction('clickAt', { x, y, button });
-    return result;
+  async _measureGeometry() {
+    const screen = this._providerInfo?.screenSize
+      || (this.provider ? await this.provider.getScreenSize().catch(() => null) : null)
+      || { width: null, height: null };
+    const vp = await this.page.evaluate(() => ({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      dpr: window.devicePixelRatio || 1,
+      screenX: window.screenX,
+      screenY: window.screenY,
+      outerWidth: window.outerWidth,
+      outerHeight: window.outerHeight,
+    }));
+    let offset = { x: 0, y: 0 };
+    let method = 'assumed-zero';
+    try {
+      const client = await this.page.createCDPSession();
+      try {
+        const { windowId } = await client.send('Browser.getWindowForTarget');
+        const { bounds } = await client.send('Browser.getWindowBounds', { windowId });
+        let viewportH = vp.height;
+        try {
+          const { cssVisualViewport } = await client.send('Page.getLayoutMetrics');
+          if (cssVisualViewport?.clientHeight) viewportH = cssVisualViewport.clientHeight;
+        } catch { /* keep innerHeight */ }
+        const chromeH = Math.max(0, (bounds.height ?? viewportH) - viewportH);
+        offset = { x: bounds.left ?? 0, y: (bounds.top ?? 0) + chromeH };
+        method = 'window-bounds';
+      } finally {
+        await client.detach().catch(() => {});
+      }
+    } catch {
+      if (Number.isFinite(vp.screenX) && Number.isFinite(vp.screenY)) {
+        offset = { x: vp.screenX, y: vp.screenY + Math.max(0, vp.outerHeight - vp.height) };
+        method = 'window-bounds';
+      }
+    }
+    return { screen, viewport: { width: vp.width, height: vp.height }, dpr: vp.dpr, offset, method };
   }
 
-  async doubleClickAt(x, y, button = 'left') {
+  /**
+   * Event-based calibration: move the desktop cursor and read where the page
+   * saw it (screenX-clientX). Non-destructive. Falls back to window bounds
+   * when no event arrives (e.g. the cursor is outside the browser window).
+   * @param {{ timeout?: number }} [opts]
+   */
+  async calibrate({ timeout = 2000 } = {}) {
     this._ensureConnected();
     this._ensureProvider();
-    const result = await this.provider.mouseDoubleClick(x, y, button);
-    this._logAction('doubleClickAt', { x, y, button });
-    return result;
+    const base = await this._measureGeometry();
+    await this.page.evaluate(() => {
+      window.__bncaCal = null;
+      window.addEventListener('mousemove', (e) => {
+        window.__bncaCal = { cx: e.clientX, cy: e.clientY, sx: e.screenX, sy: e.screenY };
+      }, { once: true });
+    });
+    const sw = base.screen.width || 1280;
+    const sh = base.screen.height || 800;
+    const cx = Math.round(sw / 2);
+    const cy = Math.round(sh / 2);
+    await this.provider.mouseMove(cx, cy);
+    await this.provider.mouseMove(cx + 5, cy + 5);
+    let ev = null;
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      ev = await this.page.evaluate(() => window.__bncaCal).catch(() => null);
+      if (ev) break;
+      await sleep(50);
+    }
+    this._geometry = ev
+      ? { ...base, offset: { x: ev.sx - ev.cx, y: ev.sy - ev.cy }, method: 'calibrated' }
+      : { ...base };
+    this._logAction('calibrate', { method: this._geometry.method, offsetX: this._geometry.offset.x, offsetY: this._geometry.offset.y });
+    return this._geometry;
   }
 
-  async drag(startX, startY, endX, endY) {
+  /** Convert page (CSS) coordinates to desktop pixels. */
+  async toDesktop(x, y) {
+    const g = await this.getGeometry();
+    return { x: Math.round(x * g.dpr + g.offset.x), y: Math.round(y * g.dpr + g.offset.y) };
+  }
+
+  /** Convert desktop pixels to page (CSS) coordinates. */
+  async toPage(x, y) {
+    const g = await this.getGeometry();
+    return { x: Math.round((x - g.offset.x) / g.dpr), y: Math.round((y - g.offset.y) / g.dpr) };
+  }
+
+  async _desktopPoint(x, y, opts) {
+    if (opts && opts.space === 'page') return this.toDesktop(x, y);
+    return { x, y };
+  }
+
+  async mouseMove(x, y, opts = {}) {
     this._ensureConnected();
     this._ensureProvider();
-    const result = await this.provider.mouseDrag(startX, startY, endX, endY);
-    this._logAction('drag', { startX, startY, endX, endY });
-    return result;
+    const p = await this._desktopPoint(x, y, opts);
+    const result = await this.provider.mouseMove(p.x, p.y);
+    this._logAction('mouseMove', { x: p.x, y: p.y, space: opts.space || 'desktop' });
+    return { ...result, outcome: 'ok' };
   }
 
-  async scrollAt(x, y, direction = 'down', amount = 3) {
+  /**
+   * @param {number} x
+   * @param {number} y
+   * @param {'left'|'right'|'middle'|{ button?: 'left'|'right'|'middle', space?: 'page'|'desktop' }} [buttonOrOpts='left']
+   */
+  async clickAt(x, y, buttonOrOpts = 'left', maybeOpts = {}) {
     this._ensureConnected();
     this._ensureProvider();
-    const result = await this.provider.scroll(x, y, direction, amount);
-    this._logAction('scrollAt', { x, y, direction, amount });
-    return result;
+    const opts = typeof buttonOrOpts === 'object' && buttonOrOpts !== null ? buttonOrOpts : { button: buttonOrOpts, ...maybeOpts };
+    const button = opts.button || 'left';
+    const p = await this._desktopPoint(x, y, opts);
+    const result = await this.provider.mouseClick(p.x, p.y, button);
+    this._logAction('clickAt', { x: p.x, y: p.y, button, space: opts.space || 'desktop' });
+    return { ...result, outcome: 'ok' };
   }
 
+  async doubleClickAt(x, y, buttonOrOpts = 'left', maybeOpts = {}) {
+    this._ensureConnected();
+    this._ensureProvider();
+    const opts = typeof buttonOrOpts === 'object' && buttonOrOpts !== null ? buttonOrOpts : { button: buttonOrOpts, ...maybeOpts };
+    const button = opts.button || 'left';
+    const p = await this._desktopPoint(x, y, opts);
+    const result = await this.provider.mouseDoubleClick(p.x, p.y, button);
+    this._logAction('doubleClickAt', { x: p.x, y: p.y, button, space: opts.space || 'desktop' });
+    return { ...result, outcome: 'ok' };
+  }
+
+  /**
+   * @param {{ space?: 'page'|'desktop', steps?: number, stepDelayMs?: number, holdMs?: number, button?: string }} [opts]
+   */
+  async drag(startX, startY, endX, endY, opts = {}) {
+    this._ensureConnected();
+    this._ensureProvider();
+    const a = await this._desktopPoint(startX, startY, opts);
+    const b = await this._desktopPoint(endX, endY, opts);
+    const dragOpts = {};
+    for (const k of ['steps', 'stepDelayMs', 'holdMs', 'button']) if (opts[k] !== undefined) dragOpts[k] = opts[k];
+    const result = await this.provider.mouseDrag(a.x, a.y, b.x, b.y, dragOpts);
+    this._logAction('drag', { startX: a.x, startY: a.y, endX: b.x, endY: b.y, space: opts.space || 'desktop' });
+    return { ...result, outcome: 'ok' };
+  }
+
+  async scrollAt(x, y, direction = 'down', amount = 3, opts = {}) {
+    this._ensureConnected();
+    this._ensureProvider();
+    const p = await this._desktopPoint(x, y, opts);
+    const result = await this.provider.scroll(p.x, p.y, direction, amount);
+    this._logAction('scrollAt', { x: p.x, y: p.y, direction, amount, space: opts.space || 'desktop' });
+    return { ...result, outcome: 'ok' };
+  }
+
+  /**
+   * Page keyboard typing (CDP) into the focused editable element. Works in
+   * every mode. Returns an uncertain outcome instead of typing into nothing.
+   */
   async typeText(text) {
     this._ensureConnected();
-    // Use Puppeteer keyboard when we have a page — works with both selector
-    // clicks (CDP focus) and coordinate clicks (X11 focus propagates to DOM).
-    // xdotool typeText only reaches the X11-focused window, not the DOM-focused
-    // element, so it fails when mixed with selector-based click.
-    if (this.page) {
-      await this.page.keyboard.type(text);
-    } else {
-      this._ensureProvider();
-      await this.provider.typeText(text);
+    const focused = await this._stateTarget().evaluate(() => {
+      const el = document.activeElement;
+      if (!el || el === document.body || el === document.documentElement) return false;
+      const tag = el.tagName.toLowerCase();
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable === true;
+    }).catch(() => false);
+    if (!focused) {
+      this._logAction('typeText', { outcome: 'uncertain', uncertainReason: 'no_focused_editable' });
+      return { success: false, outcome: 'uncertain', uncertainReason: 'no_focused_editable' };
     }
+    await this.page.keyboard.type(text);
     this._logAction('typeText', { text });
-    return { success: true };
+    return { success: true, outcome: 'ok' };
+  }
+
+  /** Native desktop key press through the provider (reaches native dialogs). W3C names accepted. */
+  async desktopKey(key) {
+    this._ensureConnected();
+    this._ensureProvider();
+    const normalized = normalizeXdoKey(key);
+    const result = await this.provider.pressKey(normalized);
+    this._logAction('desktopKey', { key: normalized });
+    return { ...result, outcome: 'ok' };
+  }
+
+  /** Native desktop typing through the provider. */
+  async desktopType(text) {
+    this._ensureConnected();
+    this._ensureProvider();
+    const result = await this.provider.typeText(text);
+    this._logAction('desktopType', { text });
+    return { ...result, outcome: 'ok' };
   }
 
   async getCursorPosition() {
@@ -1035,6 +1230,10 @@ export class BrowserSession extends EventEmitter {
     this._ensureConnected();
     this._ensureProvider();
     return this.provider.getScreenSize();
+  }
+
+  getProviderInfo() {
+    return this._providerInfo;
   }
 
   getVncUrl() {

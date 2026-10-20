@@ -185,8 +185,11 @@ describe('BrowserSession computer-use mode', { timeout: TIMEOUT }, () => {
   });
 
   it('typeText uses page.keyboard.type when page exists', async () => {
+    // typeText is page input: it needs a focused editable element
+    await session.evaluate(() => { const i = document.createElement('input'); i.id = 'legacy-type'; document.body.appendChild(i); i.focus(); });
     const result = await session.typeText('hello world');
     assert.equal(result.success, true);
+    assert.equal(await session.evaluate(() => document.getElementById('legacy-type').value), 'hello world');
     // typeText uses page.keyboard.type() instead of provider.typeText()
     // because xdotool typing doesn't reach DOM-focused elements
     const call = provider.calls.find(c => c[0] === 'typeText');
@@ -238,6 +241,7 @@ describe('Coordinate actions in non-computer-use mode', { timeout: TIMEOUT }, ()
   });
 
   it('typeText works (uses page.keyboard)', async () => {
+    await session.evaluate(() => { const i = document.createElement('input'); i.id = 'legacy-type-2'; document.body.appendChild(i); i.focus(); });
     // typeText uses page.keyboard.type() when page exists, so it works in any mode
     const result = await session.typeText('test');
     assert.equal(result.success, true);
