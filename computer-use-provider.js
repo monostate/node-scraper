@@ -26,8 +26,20 @@
 /**
  * @typedef {Object} ProviderInfo
  * @property {string} cdpUrl - WebSocket URL for Chrome DevTools Protocol (ws://...)
- * @property {string|null} vncUrl - noVNC URL for live browser view (null if unavailable)
+ * @property {string|null} vncUrl - vnc:// URL for a live view (null if unavailable)
+ * @property {{ host: string, port: number, auth: 'none'|'password', loopbackOnly: boolean }|null} [vnc] - Connection metadata for attaching an authenticated viewer
  * @property {{width: number, height: number}} screenSize - Virtual display dimensions
+ * @property {string} [display] - X display (e.g. ":12") when applicable
+ * @property {string} [profileDir] - Browser profile directory in use
+ */
+
+/**
+ * @typedef {Object} ProviderScreenshot
+ * @property {string} screenshot - base64 data URL (data:image/png;base64,...)
+ * @property {'desktop'|'page'} coordinateSpace - Which coordinates the pixels map to
+ * @property {number} width
+ * @property {number} height
+ * @property {number} dpr - Device pixel ratio of the capture
  */
 
 /**
@@ -55,11 +67,23 @@ export class ComputerUseProvider {
   }
 
   /**
-   * Capture a screenshot of the full virtual display.
-   * @returns {Promise<{screenshot: string}>} base64 data URL (data:image/png;base64,...)
+   * Capture a screenshot. `space: 'desktop'` is the whole virtual display
+   * (what mouse coordinates address); `space: 'page'` is the browser
+   * viewport only. Implementations must report which one they returned.
+   * @param {{ space?: 'desktop'|'page' }} [opts]
+   * @returns {Promise<ProviderScreenshot>}
    */
-  async screenshot() {
+  async screenshot({ space = 'desktop' } = {}) { // eslint-disable-line no-unused-vars
     throw new Error('ComputerUseProvider.screenshot() not implemented');
+  }
+
+  /**
+   * What this provider can do. Sessions use it to pick screenshot spaces and
+   * to produce actionable errors instead of silent fallbacks.
+   * @returns {Promise<{ desktopScreenshot: boolean, pageScreenshot: boolean, vnc: boolean, nativeInput: boolean }>}
+   */
+  async getCapabilities() {
+    return { desktopScreenshot: false, pageScreenshot: false, vnc: false, nativeInput: true };
   }
 
   // ── Coordinate-based actions ──────────────────────────────
@@ -97,15 +121,51 @@ export class ComputerUseProvider {
   }
 
   /**
+   * Press a mouse button at (x, y) without releasing it.
+   * @param {number} x
+   * @param {number} y
+   * @param {'left'|'right'|'middle'} [button='left']
+   * @returns {Promise<CoordinateActionResult>}
+   */
+  async mouseDown(x, y, button = 'left') { // eslint-disable-line no-unused-vars
+    throw new Error('ComputerUseProvider.mouseDown() not implemented');
+  }
+
+  /**
+   * Release a mouse button.
+   * @param {'left'|'right'|'middle'} [button='left']
+   * @returns {Promise<CoordinateActionResult>}
+   */
+  async mouseUp(button = 'left') { // eslint-disable-line no-unused-vars
+    throw new Error('ComputerUseProvider.mouseUp() not implemented');
+  }
+
+  /**
    * Drag from (startX, startY) to (endX, endY).
+   *
+   * Default implementation: move, press, interpolate `steps` moves with a
+   * delay between them (HTML5 drag-and-drop needs intermediate motion and
+   * time to fire dragstart/dragover), hold, release. Providers with a native
+   * drag primitive may override.
    * @param {number} startX
    * @param {number} startY
    * @param {number} endX
    * @param {number} endY
+   * @param {{ steps?: number, stepDelayMs?: number, holdMs?: number, button?: 'left'|'right'|'middle' }} [opts]
    * @returns {Promise<CoordinateActionResult>}
    */
-  async mouseDrag(startX, startY, endX, endY) {
-    throw new Error('ComputerUseProvider.mouseDrag() not implemented');
+  async mouseDrag(startX, startY, endX, endY, { steps = 12, stepDelayMs = 20, holdMs = 100, button = 'left' } = {}) {
+    const n = Math.max(1, Math.floor(steps));
+    await this.mouseMove(startX, startY);
+    await this.mouseDown(startX, startY, button);
+    if (holdMs > 0) await this.wait(holdMs);
+    for (let i = 1; i <= n; i++) {
+      const t = i / n;
+      await this.mouseMove(Math.round(startX + (endX - startX) * t), Math.round(startY + (endY - startY) * t));
+      if (stepDelayMs > 0) await this.wait(stepDelayMs);
+    }
+    await this.mouseUp(button);
+    return { success: true };
   }
 
   /**
@@ -121,8 +181,11 @@ export class ComputerUseProvider {
   }
 
   /**
-   * Press a key or key combination (e.g. 'Return', 'ctrl+c', 'alt+Tab').
-   * @param {string} key - xdotool-compatible key name
+   * Press a key or key combination on the DESKTOP (native input: reaches
+   * native dialogs and whatever window has X focus). Implementations should
+   * accept Puppeteer/W3C names and normalize them with normalizeXdoKey().
+   * Page-level key input lives on BrowserSession.pressKey().
+   * @param {string} key - e.g. 'Enter', 'ctrl+a', 'Control+Shift+ArrowLeft'
    * @returns {Promise<CoordinateActionResult>}
    */
   async pressKey(key) {
@@ -130,7 +193,8 @@ export class ComputerUseProvider {
   }
 
   /**
-   * Type text character by character.
+   * Type text on the DESKTOP (native input). Page-level typing lives on
+   * BrowserSession.typeText().
    * @param {string} text
    * @returns {Promise<CoordinateActionResult>}
    */
