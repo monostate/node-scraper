@@ -111,7 +111,7 @@ test/screenshots/
 # Lightpanda binaries (downloaded at install time via postinstall script)
 bin/lightpanda
 bin/lightpanda-*
-lightpanda-*
+/lightpanda-*
 !lightpanda-server.js
 # superpowers plan workspaces (scratch)
 .superpowers/
