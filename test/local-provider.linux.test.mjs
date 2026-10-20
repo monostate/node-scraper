@@ -56,15 +56,20 @@ describe('LocalProvider on real Xvfb/Chrome (Linux)', { timeout: 120000, skip },
     await assert.rejects(() => fs.stat(`/tmp/.X11-unix/X${display.slice(1)}`));
   });
 
-  it('5 start/stop cycles return the process count to baseline', async () => {
-    const baseXvfb = await count('Xvfb');
-    const baseChrome = await count('chromium');
+  it('5 start/stop cycles leave no LocalProvider processes behind', async () => {
+    // Other test files run Chrome concurrently, so count only processes that
+    // belong to LocalProvider: Chromes using its temp profile marker and the
+    // X servers it started (":N" displays other than the suite's own).
+    const settle = () => new Promise(r => setTimeout(r, 500));
+    await settle();
+    const baseXvfb = await count('Xvfb :');
     for (let i = 0; i < 5; i++) {
       const p = new LocalProvider({ noSandbox });
       await p.start();
       await p.stop();
     }
-    assert.equal(await count('Xvfb'), baseXvfb);
-    assert.equal(await count('chromium'), baseChrome);
+    await settle();
+    assert.equal(await count('bnca-chrome-profile-'), 0, 'no Chrome from a LocalProvider profile left');
+    assert.equal(await count('Xvfb :'), baseXvfb, 'no extra Xvfb left');
   });
 });

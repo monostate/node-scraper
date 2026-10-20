@@ -115,7 +115,8 @@ describe('LocalProvider (unit, stubbed processes)', () => {
 
   it('keeps the Chrome sandbox unless noSandbox is set', async () => {
     const { deps, spawned } = makeDeps();
-    const p = new LocalProvider(opts(deps));
+    // the default reads BNCA_CHROME_NO_SANDBOX; pin it off for this assertion
+    const p = new LocalProvider(opts(deps, { noSandbox: false }));
     await p.start();
     const chrome = spawned.find(c => c.name === '/usr/bin/chromium');
     assert.ok(!chrome.args.includes('--no-sandbox'));

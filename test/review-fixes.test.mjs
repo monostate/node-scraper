@@ -141,6 +141,9 @@ describe('Important 3: CLI screenshot paths honour the sandbox default', () => {
 
   it('keeps the sandbox on by default and adds --no-sandbox only when asked', async () => {
     const before = { ...browserPool.launch };
+    const envBefore = process.env.BNCA_CHROME_NO_SANDBOX;
+    delete process.env.BNCA_CHROME_NO_SANDBOX; // containers set this; the assertion is about the library default
+    browserPool.configure({ launch: { noSandbox: false } });
     try {
       const calls = [];
       const scraper = new BNCASmartScraper();
@@ -158,6 +161,7 @@ describe('Important 3: CLI screenshot paths honour the sandbox default', () => {
       await s2.screenshot('http://127.0.0.1:1/');
       assert.ok(calls2[0].includes('--no-sandbox') && calls2[0].includes('--disable-setuid-sandbox'));
     } finally {
+      if (envBefore !== undefined) process.env.BNCA_CHROME_NO_SANDBOX = envBefore;
       browserPool.configure({ launch: before });
     }
   });
