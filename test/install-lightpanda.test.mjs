@@ -154,7 +154,7 @@ describe('installLightpanda()', () => {
     const binDir = path.join(dir, 'health');
     const r = await installLightpanda(opts(binDir, { healthCheck: async () => '9.9.9' }));
     assert.equal(r.status, 'failed');
-    assert.equal(r.reason, 'health_check');
+    assert.match(r.reason, /^health_check: binary reports 9\.9\.9/);
     await assert.rejects(() => fs.stat(path.join(binDir, 'lightpanda')));
   });
 });
@@ -173,6 +173,35 @@ describe('binary discovery honours LIGHTPANDA_PATH', () => {
       assert.equal(new LightPandaServer().binaryPath, fake);
     } finally {
       if (prev === undefined) delete process.env.LIGHTPANDA_PATH; else process.env.LIGHTPANDA_PATH = prev;
+      await removeDir(dir);
+    }
+  });
+});
+
+describe('installer health-check diagnostics', () => {
+  it('reports the loader error (e.g. glibc too old) instead of a bare health_check failure', async () => {
+    const dir = await makeTempDir('bnca lp glibc ');
+    try {
+      const hits = [];
+      const server = http.createServer((req, res) => {
+        hits.push(req.url);
+        res.writeHead(200);
+        res.end(Buffer.from('#!/bin/sh\necho "lightpanda: /lib/aarch64-linux-gnu/libc.so.6: version GLIBC_2.38 not found" >&2\nexit 1\n'));
+      });
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const body = Buffer.from('#!/bin/sh\necho "lightpanda: /lib/aarch64-linux-gnu/libc.so.6: version GLIBC_2.38 not found" >&2\nexit 1\n');
+      const sha = createHash('sha256').update(body).digest('hex');
+      const asset = assetNameFor() || 'lightpanda-x86_64-linux';
+      const logs = [];
+      const r = await installLightpanda({ binDir: dir, log: (l) => logs.push(l), checksums: { [asset]: sha }, urlFor: () => `http://127.0.0.1:${server.address().port}/bin` });
+      await new Promise(res => server.close(res));
+      assert.equal(r.status, 'failed');
+      assert.match(r.reason, /^health_check: .*GLIBC_2\.38/);
+      assert.ok(logs.some(l => /GLIBC_2\.38/.test(l)), 'log line carries the loader error');
+      assert.ok(logs.some(l => /glibc/i.test(l) && /2\.38/.test(l) && /Debian 13|trixie|Ubuntu 24\.04/.test(l)), 'log explains the platform requirement');
+      await assert.rejects(() => fs.stat(path.join(dir, 'lightpanda')));
+    } finally {
       await removeDir(dir);
     }
   });

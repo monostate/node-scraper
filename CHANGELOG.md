@@ -24,6 +24,7 @@ capabilities) and the Lightpanda 1.0 upgrade.
 - `fetch --json` is used for structured `http_status`/`url`/`error`; hyphenated flags (`--with-frames`, `--http-timeout`, `--wait-ms`, `--terminate-ms`, `--cdp-max-connections`); crash detection (`errorType: 'engine_crash'`).
 - Server readiness matches the 1.0.x `server running` log line (or `/json/version`), start is idempotent, timers are cleared, a crash respawns on the next start.
 - Note: 1.0 enforces CORS by default and removed `setImmediate`; pages relying on either may now need Chrome.
+- Note: the 1.0.x Linux binaries link against glibc 2.38. Debian 12 (bookworm, `node:22-slim`) cannot run them; use Debian 13 (`node:22-trixie-slim`) or Ubuntu 24.04+. The installer reports the loader error and this hint instead of silently falling back.
 
 ### Added
 - Result fields: `transportSuccess`, `httpStatus`, `finalUrl`, `redirectChain`, `engine`, `contentStatus`, `contentReasons`, `textLength`, `trace`; `acceptContent(ctx)` caller hook (`rejected_by_caller`).

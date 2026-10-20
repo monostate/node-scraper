@@ -113,15 +113,37 @@ export async function download(url, destPath, { maxRedirects = 5, timeoutMs = 18
   }
 }
 
-/** Run `<binary> version` and return the trimmed stdout (null on any failure). */
-export function binaryVersion(binaryPath) {
+/**
+ * Run `<binary> version`. Resolves { version, error }: `version` is the first
+ * stdout line (null on failure), `error` is what the loader/binary said on
+ * failure (e.g. "GLIBC_2.38 not found"), null otherwise.
+ */
+export function binaryProbe(binaryPath) {
   return new Promise((resolve) => {
     execFile(binaryPath, ['version'], { timeout: 10000 }, (err, stdout, stderr) => {
-      if (err) return resolve(null);
+      if (err) {
+        const detail = `${stderr || ''}${stdout || ''}`.trim() || err.message;
+        return resolve({ version: null, error: detail.split('\n').find(l => l.trim()) || err.message });
+      }
       const out = `${stdout || ''}${stderr || ''}`.trim().split('\n')[0]?.trim();
-      resolve(out || null);
+      resolve({ version: out || null, error: null });
     });
   });
+}
+
+/** Run `<binary> version` and return the trimmed stdout (null on any failure). */
+export async function binaryVersion(binaryPath) {
+  return (await binaryProbe(binaryPath)).version;
+}
+
+/** Minimum glibc the official Linux binaries link against (1.0.x). */
+export const LINUX_MIN_GLIBC = '2.38';
+
+function explainLoaderError(error) {
+  if (/GLIBC_(\d+\.\d+)' not found/.test(error) || /GLIBC_\d+\.\d+ not found/.test(error)) {
+    return `Lightpanda ${LIGHTPANDA_VERSION} Linux binaries need glibc >= ${LINUX_MIN_GLIBC} (Debian 13 "trixie", Ubuntu 24.04 or newer). This system's libc is older; use a newer base image (e.g. node:22-trixie-slim) or set LIGHTPANDA_PATH to a compatible build.`;
+  }
+  return null;
 }
 
 /**
@@ -136,7 +158,7 @@ export async function installLightpanda({
   arch = process.arch,
   checksums = LIGHTPANDA_CHECKSUMS,
   urlFor = (asset) => downloadUrlFor(asset, version),
-  healthCheck = binaryVersion,
+  healthCheck = binaryProbe,
   fetchImpl = fetch,
   log = console.log,
 } = {}) {
@@ -153,8 +175,13 @@ export async function installLightpanda({
     return { status: 'unsupported', reason: `${platform}/${arch}` };
   }
 
+  const probe = async (p) => {
+    const r = await healthCheck(p);
+    return (r && typeof r === 'object') ? r : { version: r ?? null, error: null };
+  };
+
   if (!force && fs.existsSync(binaryPath)) {
-    const existing = await healthCheck(binaryPath);
+    const existing = (await probe(binaryPath)).version;
     if (existing === version) {
       await fsp.chmod(binaryPath, 0o755).catch(() => {});
       log(`lightpanda: present ${binaryPath} (${version})`);
@@ -182,11 +209,14 @@ export async function installLightpanda({
     }
 
     await fsp.chmod(stagingPath, 0o755);
-    const reported = await healthCheck(stagingPath);
+    const { version: reported, error: loaderError } = await probe(stagingPath);
     if (reported !== version) {
       await fsp.rm(stagingPath, { force: true });
-      log(`lightpanda: health check failed (binary reports ${reported ?? 'nothing'}, expected ${version})`);
-      return { status: 'failed', reason: 'health_check', path: binaryPath };
+      const detail = loaderError || `binary reports ${reported ?? 'nothing'}, expected ${version}`;
+      log(`lightpanda: health check failed: ${detail}`);
+      const hint = loaderError ? explainLoaderError(loaderError) : null;
+      if (hint) log(`lightpanda: ${hint}`);
+      return { status: 'failed', reason: `health_check: ${detail}`, hint: hint || undefined, path: binaryPath };
     }
 
     await fsp.rename(stagingPath, binaryPath);

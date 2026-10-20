@@ -27,9 +27,12 @@ verified, atomic). It never fails the install; it prints one status line.
 Opt out with `BNCA_SKIP_LIGHTPANDA_INSTALL=1`, or point the package at your
 own binary with `LIGHTPANDA_PATH=/path/to/lightpanda`.
 
-Platforms: Lightpanda ships for macOS and Linux (x86_64, aarch64). Computer-use
-mode is Linux only (`apt-get install xvfb xdotool chromium`, optional
-`x11vnc imagemagick`). Run `checkCapabilities()` to see what your machine can do.
+Platforms: Lightpanda ships for macOS and Linux (x86_64, aarch64). **The Linux
+binaries need glibc ≥ 2.38** — Debian 13 "trixie" (`node:22-trixie-slim`),
+Ubuntu 24.04 or newer; Debian 12 "bookworm" (`node:22-slim` today) cannot run
+them and the installer says so. Computer-use mode is Linux only
+(`apt-get install xvfb xdotool chromium`, optional `x11vnc imagemagick`).
+Run `checkCapabilities()` to see what your machine can do.
 
 ## Quick start
 
