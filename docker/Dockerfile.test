@@ -23,6 +23,7 @@ ENV BNCA_CHROME_NO_SANDBOX=1 \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     NODE_OPTIONS=--max-old-space-size=2048
 
-# xvfb-run gives the visual-mode tests a display; LocalProvider tests spawn their own Xvfb.
-# Node 22's --test takes glob patterns (it expands them itself), not a bare directory.
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1280x800x24", "node", "--test", "--test-timeout=180000", "test/*.test.mjs"]
+# The visual-mode tests need a display; LocalProvider tests spawn their own Xvfb.
+# Start Xvfb directly: xvfb-run (trixie) hung after the command finished and
+# never returned. Node 22's --test takes glob patterns, not a bare directory.
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 & export DISPLAY=:99; sleep 1; exec node --test --test-timeout=180000 'test/*.test.mjs'"]
