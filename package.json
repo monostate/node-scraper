@@ -55,7 +55,8 @@
   "author": "BNCA Team",
   "license": "MIT",
   "dependencies": {
-    "pdf-parse": "^2.4.5"
+    "pdf-parse": "^2.4.5",
+    "ws": "^8.22.0"
   },
   "peerDependencies": {
     "puppeteer": "^24.38.0"
@@ -83,5 +84,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "devDependencies": {
+    "puppeteer": "^24.38.0"
   }
 }
