@@ -10,6 +10,7 @@ import browserPool from './browser-pool.js';
 import { findChromePath } from './chrome-path.js';
 import { classifyContent, stripHtmlToText, CONTENT_STATUS } from './content-status.js';
 import { Trace } from './telemetry.js';
+import { Deadline } from './deadline.js';
 
 let puppeteer = null;
 try {
@@ -291,6 +292,10 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
   async scrape(url, options = {}) {
     const startTime = Date.now();
     const config = { ...this.options, ...options };
+    // One budget for the whole operation; every stage gets what is left of it.
+    const deadline = Deadline.from({ totalMs: options.deadline ?? this.options.deadline, signal: options.signal ?? this.options.signal });
+    config.deadline = deadline;
+    config.signal = deadline.signal;
     const trace = new Trace({ operation: 'scrape', url });
     const fallbackChain = [];
     const requestedMethod = config.method;
@@ -298,9 +303,30 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
 
     this.log(`🚀 Starting smart scrape for: ${url}`);
 
+    const cancelledResult = () => {
+      const aborted = deadline.reason() === 'aborted';
+      return {
+        success: false,
+        transportSuccess: false,
+        cancelled: true,
+        error: aborted ? 'operation aborted' : `deadline of ${options.deadline ?? this.options.deadline}ms exceeded`,
+        errorType: aborted ? 'cancelled' : 'timeout',
+      };
+    };
+
     const runStage = async (name, fn) => {
       const stage = trace.stage(name, { engine: name });
-      const result = await fn();
+      if (deadline.expired()) {
+        const result = cancelledResult();
+        stage.end({ outcome: 'cancelled', reason: deadline.reason(), error: result.error });
+        return result;
+      }
+      let result = await fn();
+      if (!result.success && deadline.expired()) {
+        result = { ...result, ...cancelledResult(), error: result.error || cancelledResult().error };
+        stage.end({ outcome: 'cancelled', reason: deadline.reason(), httpStatus: result.httpStatus ?? null, error: result.error });
+        return result;
+      }
       stage.end({
         outcome: result.success ? 'ok' : 'error',
         reason: result.success ? (result.needsBrowser ? 'needs_browser' : result.contentStatus) : (result.errorType || 'error'),
@@ -313,6 +339,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
 
     const finish = async (result, method, { forced = false } = {}) => {
       const out = await this._finalize(url, result, method, config, { startTime, fallbackChain: forced ? null : fallbackChain, trace });
+      deadline.dispose();
       this.emit('trace', out.trace);
       return out;
     };
@@ -404,6 +431,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       const transportOk = result.transportSuccess ?? Boolean(result.success);
       return finish(result, transportOk ? method : 'failed');
     } catch (error) {
+      deadline.dispose();
       trace.finish({ outcome: 'error', error });
       const record = trace.toJSON();
       this.emit('trace', record);
@@ -463,10 +491,14 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       }
     }
 
+    if (result.cancelled) {
+      contentStatus = CONTENT_STATUS.NAVIGATION_ERROR;
+      contentReasons = [result.errorType === 'cancelled' ? 'aborted' : 'deadline_exceeded'];
+    }
     const success = transportSuccess && contentStatus === CONTENT_STATUS.USABLE;
     const error = result.error || (success ? undefined : `content_${contentStatus}`);
     const errorType = result.errorType ?? (success ? undefined : (contentStatus === CONTENT_STATUS.BLOCKED ? 'blocked' : this.categorizeError(error)));
-    const traceOutcome = success ? 'ok' : 'error';
+    const traceOutcome = success ? 'ok' : (result.cancelled ? 'cancelled' : 'error');
     const traceRecord = trace.finish({ outcome: traceOutcome });
 
     const out = {
@@ -507,8 +539,10 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       'Upgrade-Insecure-Requests': '1',
     };
     const redirectChain = [];
+    const deadline = config.deadline instanceof Deadline ? config.deadline : null;
+    const stageTimeout = deadline ? deadline.stageTimeout(config.timeout) : config.timeout;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), config.timeout);
+    const timeoutId = setTimeout(() => controller.abort(new Error('stage timeout')), stageTimeout);
     const signal = config.signal ? AbortSignal.any([config.signal, controller.signal]) : controller.signal;
 
     try {
@@ -593,14 +627,18 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       };
     } catch (error) {
       const errorMsg = error.message || 'Unknown error';
+      let errorType = this.categorizeError(errorMsg);
+      if (error.name === 'AbortError' || /abort/i.test(errorMsg)) {
+        errorType = deadline?.reason() === 'aborted' ? 'cancelled' : 'timeout';
+      }
       return {
         success: false,
         transportSuccess: false,
         httpStatus: null,
         finalUrl: url,
         redirectChain,
-        error: `Direct fetch failed: ${errorMsg}`,
-        errorType: this.categorizeError(errorMsg),
+        error: `Direct fetch failed: ${errorType === 'cancelled' ? 'operation aborted' : errorType === 'timeout' ? `timed out after ${stageTimeout}ms` : errorMsg}`,
+        errorType,
       };
     } finally {
       clearTimeout(timeoutId);
@@ -632,7 +670,9 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     }
 
     const format = config.lightpandaFormat || 'html';
-    const timeout = Math.max(1000, Number(config.timeout) || 10000);
+    const deadline = config.deadline instanceof Deadline ? config.deadline : null;
+    const budget = deadline ? deadline.stageTimeout(Number(config.timeout) || 10000) : (Number(config.timeout) || 10000);
+    const timeout = Math.max(250, Math.floor(budget));
     const waitMs = Math.min(config.lightpandaWaitMs ?? 5000, timeout);
     const args = [
       'fetch',
@@ -657,6 +697,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       });
 
       child.on('close', (code, signal) => {
+        if (deadline?.expired() && !stdout.trim()) {
+          const aborted = deadline.reason() === 'aborted';
+          resolve({ success: false, transportSuccess: false, error: aborted ? 'Lightpanda aborted' : 'Lightpanda timed out at the deadline', errorType: aborted ? 'cancelled' : 'timeout', exitCode: code });
+          return;
+        }
         if (/has crashed|Fatal V8 Error|\$level=fatal/.test(stderr)) {
           resolve({ success: false, transportSuccess: false, error: `Lightpanda crashed: ${stderr.split('\n').find(l => l.includes('fatal') || l.includes('reason:')) || 'fatal error'}`, errorType: 'engine_crash', exitCode: code });
           return;
@@ -725,8 +770,10 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     let page = null;
     
     try {
-      // Get browser from pool
-      browser = await browserPool.getBrowser();
+      // Get browser from pool (bounded by the remaining budget)
+      const deadline = config.deadline instanceof Deadline ? config.deadline : null;
+      const navTimeout = deadline ? deadline.stageTimeout(config.timeout) : config.timeout;
+      browser = await browserPool.getBrowser({ signal: config.signal, timeout: deadline ? deadline.stageTimeout(browserPool.acquireTimeout) : undefined });
       page = await browser.newPage();
       
       // Set user agent and viewport
@@ -747,7 +794,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       // Navigate with timeout
       const response = await page.goto(url, {
         waitUntil: 'networkidle0',
-        timeout: config.timeout,
+        timeout: navTimeout,
       });
       const httpStatus = response ? response.status() : null;
       const redirectChain = response
@@ -874,16 +921,17 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     this.stats.pdf.attempts++;
     
     try {
-      // Download PDF with timeout
+      // Download PDF with timeout (bounded by the remaining budget)
+      const deadline = config.deadline instanceof Deadline ? config.deadline : null;
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), config.timeout);
+      const timeoutId = setTimeout(() => controller.abort(), deadline ? deadline.stageTimeout(config.timeout) : config.timeout);
       
       const response = await fetch(url, {
         headers: {
           'User-Agent': config.userAgent,
           'Accept': 'application/pdf,*/*'
         },
-        signal: controller.signal
+        signal: config.signal ? AbortSignal.any([config.signal, controller.signal]) : controller.signal
       });
       
       clearTimeout(timeoutId);

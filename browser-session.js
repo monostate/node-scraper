@@ -7,6 +7,7 @@ import browserPool, { buildLaunchArgs } from './browser-pool.js';
 import { redactUrl, SENSITIVE_FIELD_RE } from './redact.js';
 import { collectPageState, DEFAULT_REF_ATTR } from './page-state.js';
 import { normalizeXdoKey } from './keymap.js';
+import { Deadline } from './deadline.js';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -57,7 +58,8 @@ export class BrowserSession extends EventEmitter {
    * @param {boolean} [options.noSandbox] - Launch Chrome without its sandbox (containers); default keeps the sandbox on
    * @param {boolean} [options.disableWebSecurity] - Disable same-origin policy in Chrome (off by default)
    * @param {number} [options.acquireTimeout=30000] - Max wait for a pooled browser
-   * @param {AbortSignal} [options.signal] - Abort connecting/queued acquisition
+   * @param {AbortSignal} [options.signal] - Abort connecting, queued acquisition and every later action
+   * @param {number} [options.deadline] - Total budget in ms for the whole session (connect + actions); actions after expiry reject with DeadlineError
    * @param {number} [options.maxStateText=3000] - Default text budget for getPageState()
    * @param {number} [options.maxStateElements=50] - Default element budget for getPageState()
    * @param {object|Function} [options.dialogHandler] - { action:'accept'|'dismiss', promptText? } or async (dialog) => decision; default dismisses
@@ -80,7 +82,8 @@ export class BrowserSession extends EventEmitter {
     this.recordTypedText = options.recordTypedText ?? false;
     this.redact = options.redact ?? true;
     this.acquireTimeout = options.acquireTimeout ?? 30000;
-    this.signal = options.signal || null;
+    this.deadline = Deadline.from({ totalMs: options.deadline, signal: options.signal });
+    this.signal = options.signal || options.deadline != null ? this.deadline.signal : null;
     this.launch = {
       ...(options.noSandbox !== undefined && { noSandbox: options.noSandbox }),
       ...(options.disableWebSecurity !== undefined && { disableWebSecurity: options.disableWebSecurity }),
@@ -121,6 +124,7 @@ export class BrowserSession extends EventEmitter {
 
   async connect() {
     if (this._connected) return this;
+    this.deadline.throwIfExpired();
 
     if (this.mode === 'computer-use') {
       await this._connectViaProvider();
@@ -149,7 +153,7 @@ export class BrowserSession extends EventEmitter {
 
   async _connectLightPanda() {
     const server = getLightPandaServer(this.lightpandaPath);
-    const endpoint = await server.start();
+    const endpoint = await server.start({ signal: this.signal || undefined });
 
     const puppeteer = await this._getPuppeteer();
     this.browser = await puppeteer.connect({ browserWSEndpoint: endpoint });
@@ -226,7 +230,7 @@ export class BrowserSession extends EventEmitter {
     try {
       const response = await this.page.goto(url, {
         waitUntil: options.waitUntil || 'networkidle0',
-        timeout: options.timeout || this.timeout,
+        timeout: this._timeout(options.timeout),
       });
       const httpStatus = response ? response.status() : null;
       this._logAction('goto', { url, httpStatus });
@@ -242,13 +246,13 @@ export class BrowserSession extends EventEmitter {
 
   async goBack() {
     this._ensureConnected();
-    await this.page.goBack({ waitUntil: 'networkidle0', timeout: this.timeout });
+    await this.page.goBack({ waitUntil: 'networkidle0', timeout: this._timeout() });
     this._logAction('goBack');
   }
 
   async goForward() {
     this._ensureConnected();
-    await this.page.goForward({ waitUntil: 'networkidle0', timeout: this.timeout });
+    await this.page.goForward({ waitUntil: 'networkidle0', timeout: this._timeout() });
     this._logAction('goForward');
   }
 
@@ -259,7 +263,7 @@ export class BrowserSession extends EventEmitter {
     let dispatched = false;
     try {
       const target = this._stateTarget();
-      await target.waitForSelector(selector, { timeout: options.timeout || this.timeout });
+      await target.waitForSelector(selector, { timeout: this._timeout(options.timeout) });
       const urlBefore = this.page.url();
       dispatched = true;
       await target.click(selector);
@@ -270,7 +274,7 @@ export class BrowserSession extends EventEmitter {
       let navError = null;
       if (options.waitForNavigation !== false) {
         try {
-          await this.page.waitForNavigation({ timeout: options.navigationTimeout ?? 3000, waitUntil: 'networkidle0' });
+          await this.page.waitForNavigation({ timeout: this._timeout(options.navigationTimeout ?? 3000), waitUntil: 'networkidle0' });
         } catch (err) {
           if (!/timeout/i.test(err.message || '')) navError = err;
         }
@@ -316,7 +320,7 @@ export class BrowserSession extends EventEmitter {
     let dispatched = false;
     try {
       const target = this._stateTarget();
-      await target.waitForSelector(selector, { timeout: options.timeout || this.timeout });
+      await target.waitForSelector(selector, { timeout: this._timeout(options.timeout) });
       dispatched = true;
       if (options.clear) {
         await target.click(selector, { clickCount: 3 });
@@ -359,7 +363,7 @@ export class BrowserSession extends EventEmitter {
     }
 
     const target = this._stateTarget();
-    await target.waitForSelector(selector, { timeout: this.timeout });
+    await target.waitForSelector(selector, { timeout: this._timeout() });
     await target.hover(selector);
     this._logAction('hover', { selector });
     return { success: true, outcome: 'ok' };
@@ -368,7 +372,7 @@ export class BrowserSession extends EventEmitter {
   async select(selector, ...values) {
     this._ensureConnected();
     const target = this._stateTarget();
-    await target.waitForSelector(selector, { timeout: this.timeout });
+    await target.waitForSelector(selector, { timeout: this._timeout() });
     try {
       await target.select(selector, ...values);
     } catch (err) {
@@ -426,7 +430,7 @@ export class BrowserSession extends EventEmitter {
 
   async waitFor(selector, timeout) {
     this._ensureConnected();
-    await this._stateTarget().waitForSelector(selector, { timeout: timeout || this.timeout });
+    await this._stateTarget().waitForSelector(selector, { timeout: this._timeout(timeout) });
     return { success: true, outcome: 'ok' };
   }
 
@@ -810,7 +814,7 @@ export class BrowserSession extends EventEmitter {
     this._ensureConnected();
     const { paths, meta } = await this._materializeFiles(files);
     const target = this._stateTarget();
-    const handle = await target.waitForSelector(selector, { timeout: timeout || this.timeout });
+    const handle = await target.waitForSelector(selector, { timeout: this._timeout(timeout) });
     let dispatched = false;
     try {
       dispatched = true;
@@ -1518,6 +1522,7 @@ export class BrowserSession extends EventEmitter {
     this.context = null;
     this.browser = null;
     this._connected = false;
+    this.deadline.dispose();
     this._log('Session closed');
   }
 
@@ -1527,6 +1532,12 @@ export class BrowserSession extends EventEmitter {
     if (!this._connected || !this.page) {
       throw new Error('Session not connected. Call connect() first.');
     }
+    this.deadline.throwIfExpired();
+  }
+
+  /** A per-action timeout that never exceeds what is left of the session deadline. */
+  _timeout(ms) {
+    return this.deadline.stageTimeout(ms ?? this.timeout);
   }
 
   async _getPuppeteer() {
