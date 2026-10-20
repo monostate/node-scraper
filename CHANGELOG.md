@@ -1,5 +1,53 @@
 # Changelog
 
+## [3.0.0] - 2026-10-20
+
+Hardening release driven by an external audit of 2.2.2 (session isolation,
+pool races, process lifecycle, truthful outcomes, redaction, platform
+capabilities) and the Lightpanda 1.0 upgrade.
+
+### Breaking Changes
+- **`success` means usable content** — `scrape()` now returns `success: true` only when the transport worked *and* `contentStatus === 'usable'`. Empty bodies, SPA shells, block/challenge pages and 4xx/5xx are `success: false` with `contentStatus` set (`empty`, `browser_required_shell`, `blocked`, `navigation_error`). `transportSuccess` tells you whether the request itself completed.
+- **Chrome sandbox and web security stay on** by default. Containers must opt in with `noSandbox: true` (or `BNCA_CHROME_NO_SANDBOX=1`); `disableWebSecurity: true` is explicit.
+- **Hosted AI endpoint removed** — `askAI()` no longer falls back to `bnca-api.fly.dev`. Pass `{ aiEndpoint, aiApiKey }` for your own service; a bare `apiKey` is ignored with a one-time warning.
+- **Pooled sessions are isolated** — `BrowserSession` creates a fresh browser context per session (`isolate: true`). `isolate: false` restores the shared default context.
+- **Mutating actions are never replayed** — `click/type/select/pressKey` return `outcome: 'uncertain'` (with `uncertainReason`) when the request left but no usable response came back, instead of retrying on another engine. An LP click that fails to navigate switches to Chrome and reports `uncertain` (previously it re-clicked).
+- **`typeText()` needs a focused editable** — returns `outcome: 'uncertain', uncertainReason: 'no_focused_editable'` instead of typing into the body. Native typing is `desktopType()`.
+- **`screenshot()` in computer-use mode captures the desktop** by default and returns `{ coordinateSpace, width, height, dpr, offset }`; ask for `{ space: 'page' }` explicitly.
+- **`stopLightPandaServer()` and `LightPandaServer.stop()` are async** and await process exit.
+- **`BrowserPool.closeAll()` drains; `shutdown()` closes** — `closeAll()` rejects queued callers and closes browsers but the pool stays usable (what `scraper.cleanup()` relies on). `shutdown()` is the permanent close; `reopen()` reverses it.
+- **No SIGTERM/SIGINT listeners** are registered by the library any more (they swallowed the host's signals). Call `scraper.cleanup()` / `stopLightPandaServer()` from your own handlers.
+- **Puppeteer peer range** is `>=24.38.0 <26`; `ws` is now a declared dependency. Node 20+.
+
+### Lightpanda 1.0.1
+- Installer pins release `1.0.1` (tags no longer carry a `v`), verifies SHA-256 for all four assets, downloads to a temp file and renames atomically, bounds redirects, version-checks an existing binary and replaces stale ones, health-checks the binary, and never fails `npm install` (`BNCA_SKIP_LIGHTPANDA_INSTALL=1` to skip, `LIGHTPANDA_PATH` to point at your own).
+- `fetch --json` is used for structured `http_status`/`url`/`error`; hyphenated flags (`--with-frames`, `--http-timeout`, `--wait-ms`, `--terminate-ms`, `--cdp-max-connections`); crash detection (`errorType: 'engine_crash'`).
+- Server readiness matches the 1.0.x `server running` log line (or `/json/version`), start is idempotent, timers are cleared, a crash respawns on the next start.
+- Note: 1.0 enforces CORS by default and removed `setImmediate`; pages relying on either may now need Chrome.
+
+### Added
+- Result fields: `transportSuccess`, `httpStatus`, `finalUrl`, `redirectChain`, `engine`, `contentStatus`, `contentReasons`, `textLength`, `trace`; `acceptContent(ctx)` caller hook (`rejected_by_caller`).
+- `deadline` (total budget) and `signal` (AbortSignal) for `scrape()` and `BrowserSession`; every stage gets only the remaining budget; stages after expiry are `cancelled`.
+- `BrowserSession` mode `'chrome'` (pooled headless Chrome), `checkpoint()/restore()`, `frames()/useFrame()/useMainFrame()`, `pages()/usePage()/waitForNewPage()` + `'newPage'` event, shadow-root `pierce/` refs, `setDialogHandler()/getDialogs()`, `uploadFile()`, `waitForFileChooser()`, `enableDownloads()/downloads()/waitForDownload()`, `getGeometry()/calibrate()/toDesktop()/toPage()`, `{ space }` on every coordinate action, `desktopKey()/desktopType()`, `getProviderInfo()`.
+- `getPageState()` v2: stable `[data-bnca-ref]` selectors, role/label/required/disabled/checked/invalid/validationMessage/bounds, forms with validity, configurable limits with truncation reporting, redacted sensitive values, works inside frames and shadow roots.
+- Redaction everywhere by default: typed text, password/OTP values, URL secrets never enter history, page state, traces or error messages (`recordTypedText`, `redact` to opt out).
+- `checkCapabilities()` / `requireCapability()` / `CapabilityError` with install hints; `modes` says what the machine can run.
+- `Trace` telemetry: per-stage engine, duration, queue time, bytes, HTTP status, outcome, token usage; `scraper.on('trace')`.
+- `LocalProvider`: transactional start/stop with rollback, unique display lock, temp profile, readiness checks, minimal child environment, loopback-only VNC (password required for other binds) verified before use, `screenshot({ space })` (desktop via ImageMagick), `mouseDown/mouseUp`, interpolated `mouseDrag`, W3C key names.
+- `BrowserPool`: reservations (never exceeds the max), cancellable bounded queue, crash recovery, events, `configure()`.
+- Exports: `BrowserPool`, `Deadline`, `CONTENT_STATUS`, `classifyContent`, `findChromePath`, `checkCapabilities`, `Trace`, redaction helpers, `normalizeXdoKey`, `LIGHTPANDA_VERSION`, `installLightpanda`, `getBrowserPoolStats`, process helpers.
+- Linux Docker test image, packed-tarball smoke test, GitHub Actions matrix (Node 20/22, linux/amd64 + linux/arm64), computer-use Docker example.
+
+### Fixed
+- Pool could exceed its maximum under concurrent acquisition; queued callers could hang forever; a crashed browser left a dead slot.
+- Sessions sharing a pooled browser could read each other's cookies and storage.
+- Paths with spaces broke binary discovery (`new URL().pathname` → `fileURLToPath`).
+- Duplicate `cleanup()` definition; bulk stats never counted `direct-fetch`.
+- Chrome binary discovery is shared (`findChromePath`, honours `BNCA_CHROME_PATH`, `PUPPETEER_EXECUTABLE_PATH`, `CHROME_PATH`).
+
+### Known behaviour
+- Chromium's HTTP transport re-sends a navigation POST once when the socket died before any response headers arrived (preconnected sockets count as reused). This happens below the DevTools request layer and outside the library; treat `outcome: 'uncertain'` as "possibly written".
+
 ## [2.0.0] - 2026-03-07
 
 ### Breaking Changes

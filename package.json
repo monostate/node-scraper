@@ -97,6 +97,7 @@
     "access": "public"
   },
   "devDependencies": {
-    "puppeteer": "^24.38.0"
+    "puppeteer": "^24.38.0",
+    "typescript": "^5.9.3"
   }
 }

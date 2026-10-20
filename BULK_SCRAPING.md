@@ -624,3 +624,16 @@ If many URLs fail:
 2. Verify URLs are correct
 3. Use `puppeteer` method for JavaScript-heavy sites
 4. Implement retry logic with backoff
+## Deadlines and cancellation (v3)
+
+Every URL in a bulk run accepts the same `deadline` (total ms across all
+engines) and `signal` (AbortSignal) options as `scrape()`. A URL that runs
+out of budget comes back with `errorType: 'timeout'` (or `'cancelled'` when
+the signal aborted) and `contentStatus: 'navigation_error'`; later stages are
+skipped and recorded as `cancelled` in `result.trace`.
+
+```javascript
+const ac = new AbortController();
+setTimeout(() => ac.abort(), 60_000); // stop the whole run after a minute
+await bulkScrape(urls, { concurrency: 5, deadline: 15_000, signal: ac.signal });
+```
