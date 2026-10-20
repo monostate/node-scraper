@@ -1,71 +1,96 @@
 /**
- * LocalProvider — runs Xvfb + Chrome + xdotool on the local machine.
+ * LocalProvider — Xvfb + Chrome + xdotool (+ optional x11vnc) on this machine.
  *
- * Requires Linux with: xvfb, xdotool, chromium/google-chrome
- * Optional: x11vnc, noVNC (for VNC streaming)
+ * Requires Linux with: xvfb, xdotool, chromium/google-chrome.
+ * Optional: x11vnc (live view), imagemagick (`import`, desktop screenshots).
+ *
+ * Lifecycle is transactional: every resource acquired by start() (display
+ * lock, temp profile, Xvfb, Chrome, x11vnc) is released in reverse order if a
+ * later step fails, and stop() awaits process exit with SIGTERM→SIGKILL.
+ * Children get a minimal environment, never the parent's secrets.
  *
  * @example
  * import { createSession, LocalProvider } from '@monostate/node-scraper';
  *
  * const session = await createSession({
  *   mode: 'computer-use',
- *   provider: new LocalProvider({ screenWidth: 1280, screenHeight: 800 }),
+ *   provider: new LocalProvider({ screenWidth: 1280, screenHeight: 800, enableVnc: true }),
  * });
  * await session.goto('https://example.com');
  * await session.clickAt(640, 400);
  * await session.close();
  */
 
+import { spawn as nodeSpawn, execFile as nodeExecFile } from 'node:child_process';
+import { connect } from 'node:net';
 import { ComputerUseProvider } from '../computer-use-provider.js';
-import { spawn, execFile } from 'child_process';
-import { createServer } from 'net';
+import { normalizeXdoKey } from '../keymap.js';
+import { CapabilityError, INSTALL_HINTS } from '../capabilities.js';
+import { findChromePath } from '../chrome-path.js';
+import {
+  terminate, waitForHttpOk, waitForTcp, waitForPath, findFreePort,
+  makeTempDir, removeDir, minimalEnv, allocateDisplay,
+} from '../process-util.js';
 
-function findFreePort() {
-  return new Promise((resolve, reject) => {
-    const srv = createServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const port = srv.address().port;
-      srv.close(() => resolve(port));
-    });
-    srv.on('error', reject);
-  });
-}
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
 
-function waitForProcess(proc, readyCheck, timeoutMs = 10000) {
+function execAsync(cmd, args, { env, timeout = 10000 } = {}) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Process startup timed out')), timeoutMs);
-    const check = setInterval(async () => {
-      try {
-        if (await readyCheck()) {
-          clearTimeout(timer);
-          clearInterval(check);
-          resolve();
-        }
-      } catch { /* still starting */ }
-    }, 200);
-    proc.on('error', (err) => {
-      clearTimeout(timer);
-      clearInterval(check);
-      reject(err);
-    });
-    proc.on('exit', (code) => {
-      if (code !== 0 && code !== null) {
-        clearTimeout(timer);
-        clearInterval(check);
-        reject(new Error(`Process exited with code ${code}`));
-      }
-    });
-  });
-}
-
-function execAsync(cmd, args, env) {
-  return new Promise((resolve, reject) => {
-    execFile(cmd, args, { env, timeout: 10000 }, (err, stdout, stderr) => {
+    nodeExecFile(cmd, args, { env, timeout }, (err, stdout, stderr) => {
       if (err) reject(err);
-      else resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
+      else resolve({ stdout: String(stdout).trim(), stderr: String(stderr).trim() });
     });
   });
 }
+
+function execBuffer(cmd, args, { env, timeout = 15000 } = {}) {
+  return new Promise((resolve, reject) => {
+    nodeExecFile(cmd, args, { env, timeout, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout);
+    });
+  });
+}
+
+function whichAsync(name) {
+  return new Promise((resolve) => {
+    nodeExecFile('which', [name], { timeout: 3000 }, (err, stdout) => resolve(!err && stdout.trim() ? stdout.trim().split('\n')[0] : null));
+  });
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+  return res.json();
+}
+
+function probeVnc(host, port, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const sock = connect({ host, port });
+    sock.setTimeout(timeoutMs);
+    sock.once('data', (d) => { sock.destroy(); resolve(d.toString()); });
+    sock.once('error', reject);
+    sock.once('timeout', () => { sock.destroy(); reject(new Error('VNC banner timeout')); });
+  });
+}
+
+const DEFAULT_DEPS = Object.freeze({
+  spawn: nodeSpawn,
+  execFile: execAsync,
+  execFileBuffer: execBuffer,
+  which: whichAsync,
+  waitForPath,
+  waitForHttpOk,
+  waitForTcp,
+  fetchJson,
+  probeVnc,
+  findChromePath,
+  allocateDisplay,
+  makeTempDir,
+  removeDir,
+  terminate,
+  findFreePort,
+});
 
 export class LocalProvider extends ComputerUseProvider {
   /**
@@ -73,249 +98,368 @@ export class LocalProvider extends ComputerUseProvider {
    * @param {number} [options.screenWidth=1280]
    * @param {number} [options.screenHeight=800]
    * @param {boolean} [options.enableVnc=false]
-   * @param {string} [options.chromePath] - Path to Chrome/Chromium binary (auto-detected)
-   * @param {string[]} [options.chromeArgs] - Additional Chrome launch args
+   * @param {{ bind?: string, password?: string|null, shared?: boolean }} [options.vnc] - loopback-only by default; a non-loopback bind requires a password
+   * @param {string} [options.chromePath] - Chrome/Chromium binary (auto-detected)
+   * @param {string[]} [options.chromeArgs] - Extra Chrome args
+   * @param {Record<string,string>} [options.env] - Extra environment for children
+   * @param {boolean} [options.inheritEnv=false] - Copy the whole parent environment into children (off: PATH/HOME/LANG/… only)
+   * @param {boolean} [options.noSandbox] - Launch Chrome without its sandbox (default: BNCA_CHROME_NO_SANDBOX=1)
+   * @param {number} [options.startTimeoutMs=15000]
+   * @param {string|null} [options.profileDir=null] - Use (and keep) this profile dir instead of a temp one
    */
   constructor(options = {}) {
     super();
     this.screenWidth = options.screenWidth || 1280;
     this.screenHeight = options.screenHeight || 800;
     this.enableVnc = options.enableVnc ?? false;
+    this.vncOptions = { bind: '127.0.0.1', password: null, shared: true, ...(options.vnc || {}) };
     this.chromePath = options.chromePath || null;
     this.chromeArgs = options.chromeArgs || [];
+    this.extraEnv = options.env || {};
+    this.inheritEnv = options.inheritEnv ?? false;
+    this.noSandbox = options.noSandbox ?? (process.env.BNCA_CHROME_NO_SANDBOX === '1');
+    this.startTimeoutMs = options.startTimeoutMs ?? 15000;
+    this.profileDirOption = options.profileDir || null;
+    this.platform = options.platform || process.platform;
+    this.lockDir = options.lockDir || '/tmp';
+    this._deps = { ...DEFAULT_DEPS, ...(options.deps || {}) };
+
+    if (this.enableVnc && !LOOPBACK.has(this.vncOptions.bind) && !this.vncOptions.password) {
+      throw new Error('VNC on a non-loopback bind requires vnc.password (set vnc.bind to 127.0.0.1 or provide a password)');
+    }
 
     this._display = null;
     this._displayNum = null;
+    this._displayLease = null;
+    this._profileDir = null;
+    this._lastProfileDir = null;
+    this._profileIsTemp = false;
     this._cdpPort = null;
+    this._cdpWsUrl = null;
     this._vncPort = null;
     this._xvfbProc = null;
     this._chromeProc = null;
     this._vncProc = null;
     this._env = null;
-    this._cdpWsUrl = null;
+    this._info = null;
+    this._starting = null;
+    this._stopping = null;
   }
+
+  // ── Lifecycle ─────────────────────────────────────────────
 
   async start() {
-    if (process.platform !== 'linux') {
-      throw new Error(
-        'LocalProvider requires Linux (Xvfb + xdotool). ' +
-        'On macOS/Windows, use Docker or a remote provider.'
-      );
+    if (this._info) return this._info;
+    if (this._starting) return this._starting;
+    this._starting = this._start().finally(() => { this._starting = null; });
+    return this._starting;
+  }
+
+  async _start() {
+    if (this.platform !== 'linux') {
+      throw new Error('LocalProvider requires Linux (Xvfb + xdotool). On macOS/Windows, use Docker or a remote provider.');
     }
+    if (this._stopping) await this._stopping;
 
-    // Find free ports
-    this._cdpPort = await findFreePort();
-    this._displayNum = 10 + Math.floor(Math.random() * 90); // :10-:99
-    this._display = `:${this._displayNum}`;
+    const d = this._deps;
+    const cleanup = [];
+    let step = 'display';
+    try {
+      // 1. Display number nobody else uses
+      this._displayLease = await d.allocateDisplay({ lockDir: this.lockDir });
+      this._display = this._displayLease.display;
+      this._displayNum = this._displayLease.displayNum;
+      cleanup.push(async () => { await this._displayLease?.release(); this._displayLease = null; this._display = null; this._displayNum = null; });
 
-    this._env = {
-      ...process.env,
-      DISPLAY: this._display,
-      DBUS_SESSION_BUS_ADDRESS: '/dev/null',
-    };
+      // 2. Profile directory
+      step = 'profile';
+      this._profileIsTemp = !this.profileDirOption;
+      this._profileDir = this.profileDirOption || await d.makeTempDir('bnca-chrome-profile-');
+      this._lastProfileDir = this._profileDir;
+      cleanup.push(async () => { if (this._profileIsTemp) await d.removeDir(this._profileDir); this._profileDir = null; });
 
-    // 1. Start Xvfb
-    this._xvfbProc = spawn('Xvfb', [
-      this._display,
-      '-screen', '0', `${this.screenWidth}x${this.screenHeight}x24`,
-      '-ac',
-    ], { stdio: 'pipe', env: this._env });
+      // 3. Environment for children: minimal unless asked otherwise
+      const base = { DISPLAY: this._display, DBUS_SESSION_BUS_ADDRESS: '/dev/null', ...this.extraEnv };
+      this._env = this.inheritEnv ? { ...process.env, ...base } : minimalEnv(base);
 
-    await new Promise(resolve => setTimeout(resolve, 500));
+      // 4. Xvfb
+      step = 'xvfb';
+      this._xvfbProc = d.spawn('Xvfb', [
+        this._display,
+        '-screen', '0', `${this.screenWidth}x${this.screenHeight}x24`,
+        '-ac', '-nolisten', 'tcp',
+      ], { stdio: 'pipe', env: this._env });
+      cleanup.push(async () => { await d.terminate(this._xvfbProc, { graceMs: 2000 }); this._xvfbProc = null; });
+      await this._raceExit(this._xvfbProc, d.waitForPath(`/tmp/.X11-unix/X${this._displayNum}`, { timeoutMs: 5000 }));
 
-    // 2. Find Chrome binary
-    const chromePath = this.chromePath || await this._findChrome();
+      // 5. Chrome
+      step = 'chrome';
+      const chromePath = this.chromePath || await d.findChromePath();
+      if (!chromePath) {
+        throw new CapabilityError('chrome', INSTALL_HINTS.chrome);
+      }
+      this._cdpPort = await d.findFreePort();
+      const chromeArgs = [
+        `--remote-debugging-port=${this._cdpPort}`,
+        '--remote-debugging-address=127.0.0.1',
+        `--user-data-dir=${this._profileDir}`,
+        '--window-position=0,0',
+        `--window-size=${this.screenWidth},${this.screenHeight}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-sync',
+        '--disable-extensions',
+        '--disable-component-update',
+        '--disable-background-networking',
+        '--disable-features=dbus,TranslateUI',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        ...(this.noSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : []),
+        ...this.chromeArgs,
+        'about:blank',
+      ];
+      this._chromeProc = d.spawn(chromePath, chromeArgs, { stdio: 'pipe', env: this._env });
+      cleanup.push(async () => { await d.terminate(this._chromeProc, { graceMs: 3000 }); this._chromeProc = null; });
+      const versionUrl = `http://127.0.0.1:${this._cdpPort}/json/version`;
+      await this._raceExit(this._chromeProc, d.waitForHttpOk(versionUrl, { timeoutMs: this.startTimeoutMs }));
+      const version = await d.fetchJson(versionUrl);
+      this._cdpWsUrl = version.webSocketDebuggerUrl;
+      if (!this._cdpWsUrl) throw new Error('Chrome did not report a webSocketDebuggerUrl');
 
-    // 3. Start Chrome
-    const chromeArgs = [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      `--remote-debugging-port=${this._cdpPort}`,
-      '--remote-debugging-address=127.0.0.1',
-      `--window-size=${this.screenWidth},${this.screenHeight}`,
-      '--disable-features=dbus',
-      '--disable-sync',
-      '--disable-extensions',
-      '--disable-component-update',
-      '--no-first-run',
-      '--user-data-dir=/tmp/chrome-local-provider-' + this._displayNum,
-      ...this.chromeArgs,
-      'about:blank',
-    ];
-
-    this._chromeProc = spawn(chromePath, chromeArgs, {
-      stdio: 'pipe',
-      env: this._env,
-    });
-
-    // Wait for CDP to be ready
-    await waitForProcess(this._chromeProc, async () => {
-      const res = await fetch(`http://127.0.0.1:${this._cdpPort}/json/version`);
-      return res.ok;
-    }, 15000);
-
-    // Get the CDP WebSocket URL
-    const versionRes = await fetch(`http://127.0.0.1:${this._cdpPort}/json/version`);
-    const versionData = await versionRes.json();
-    this._cdpWsUrl = versionData.webSocketDebuggerUrl;
-
-    // 4. Optionally start VNC
-    let vncUrl = null;
-    if (this.enableVnc) {
-      try {
-        this._vncPort = await findFreePort();
-        this._vncProc = spawn('x11vnc', [
+      // 6. Optional VNC, verified before we claim it
+      step = 'vnc';
+      let vnc = null;
+      let vncUrl = null;
+      if (this.enableVnc) {
+        const { bind, password, shared } = this.vncOptions;
+        const loopbackOnly = LOOPBACK.has(bind);
+        this._vncPort = await d.findFreePort();
+        const vncArgs = [
           '-display', this._display,
           '-rfbport', String(this._vncPort),
-          '-shared', '-nopw', '-forever',
-        ], { stdio: 'pipe', env: this._env });
-        await new Promise(resolve => setTimeout(resolve, 500));
-        vncUrl = `vnc://127.0.0.1:${this._vncPort}`;
-      } catch {
-        // VNC is optional — don't fail if x11vnc is not installed
+          '-forever',
+          ...(shared ? ['-shared'] : []),
+          ...(loopbackOnly ? ['-localhost'] : ['-listen', bind]),
+          ...(password ? ['-passwd', password] : ['-nopw']),
+        ];
+        this._vncProc = d.spawn('x11vnc', vncArgs, { stdio: 'pipe', env: this._env });
+        cleanup.push(async () => { await d.terminate(this._vncProc, { graceMs: 2000 }); this._vncProc = null; });
+        const host = loopbackOnly ? '127.0.0.1' : bind;
+        await this._raceExit(this._vncProc, d.waitForTcp(host, this._vncPort, { timeoutMs: 5000 }));
+        const banner = await d.probeVnc(host, this._vncPort);
+        if (!/^RFB/.test(String(banner))) throw new Error(`unexpected VNC banner: ${String(banner).slice(0, 20)}`);
+        vnc = { host, port: this._vncPort, auth: password ? 'password' : 'none', loopbackOnly };
+        vncUrl = `vnc://${host}:${this._vncPort}`;
       }
-    }
 
-    return {
-      cdpUrl: this._cdpWsUrl,
-      vncUrl,
-      screenSize: { width: this.screenWidth, height: this.screenHeight },
-    };
+      this._info = {
+        cdpUrl: this._cdpWsUrl,
+        vncUrl,
+        vnc,
+        screenSize: { width: this.screenWidth, height: this.screenHeight },
+        display: this._display,
+        profileDir: this._profileDir,
+      };
+      return this._info;
+    } catch (err) {
+      await this._runCleanup(cleanup);
+      const error = new Error(`LocalProvider start failed at ${step}: ${err.message}`);
+      error.step = step;
+      error.cause = err;
+      if (err instanceof CapabilityError) { error.code = err.code; error.capability = err.capability; error.install = err.install; }
+      throw error;
+    }
   }
 
-  async stop() {
-    for (const proc of [this._vncProc, this._chromeProc, this._xvfbProc]) {
-      if (proc && !proc.killed) {
-        try { proc.kill('SIGTERM'); } catch { /* ignore */ }
-      }
-    }
-    this._vncProc = null;
-    this._chromeProc = null;
-    this._xvfbProc = null;
-  }
-
-  async screenshot() {
-    // Use CDP Page.captureScreenshot
-    const pagesRes = await fetch(`http://127.0.0.1:${this._cdpPort}/json`);
-    const pages = await pagesRes.json();
-    const page = pages[0];
-    if (!page) throw new Error('No open pages for screenshot');
-
-    const wsUrl = page.webSocketDebuggerUrl;
-    const { default: WebSocket } = await import('ws');
-
+  /** Reject as soon as the child exits while we wait for its readiness signal. */
+  _raceExit(proc, readyPromise) {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(wsUrl);
-      ws.on('open', () => {
-        ws.send(JSON.stringify({ id: 1, method: 'Page.captureScreenshot', params: { format: 'png' } }));
-      });
-      ws.on('message', (data) => {
-        const msg = JSON.parse(data.toString());
-        if (msg.id === 1) {
-          ws.close();
-          if (msg.error) {
-            reject(new Error(msg.error.message));
-          } else {
-            resolve({ screenshot: `data:image/png;base64,${msg.result.data}` });
-          }
-        }
-      });
-      ws.on('error', reject);
-      setTimeout(() => { ws.close(); reject(new Error('Screenshot timed out')); }, 10000);
+      let settled = false;
+      const onExit = (code, signal) => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`${proc.name || 'process'} exited (code ${code}${signal ? `, ${signal}` : ''}) before becoming ready`));
+      };
+      proc.once('exit', onExit);
+      proc.once('error', (err) => { if (!settled) { settled = true; reject(err); } });
+      readyPromise.then(
+        (v) => { if (!settled) { settled = true; proc.off('exit', onExit); resolve(v); } },
+        (e) => { if (!settled) { settled = true; proc.off('exit', onExit); reject(e); } },
+      );
     });
   }
 
-  // ── Coordinate-based actions via xdotool ──────────────────
+  async _runCleanup(fns) {
+    for (const fn of fns.reverse()) {
+      try { await fn(); } catch { /* best effort */ }
+    }
+  }
+
+  /**
+   * Stop everything and wait for it to be gone. Idempotent.
+   * @param {{ graceMs?: number }} [opts]
+   */
+  async stop({ graceMs = 2000 } = {}) {
+    if (this._stopping) return this._stopping;
+    this._stopping = this._stop(graceMs).finally(() => { this._stopping = null; });
+    return this._stopping;
+  }
+
+  async _stop(graceMs) {
+    if (this._starting) { try { await this._starting; } catch { /* start already rolled back */ } }
+    const d = this._deps;
+    for (const key of ['_vncProc', '_chromeProc', '_xvfbProc']) {
+      const proc = this[key];
+      if (proc) {
+        try { await d.terminate(proc, { graceMs }); } catch { /* ignore */ }
+        this[key] = null;
+      }
+    }
+    if (this._profileDir && this._profileIsTemp) {
+      try { await d.removeDir(this._profileDir); } catch { /* ignore */ }
+    }
+    this._profileDir = null;
+    if (this._displayLease) {
+      try { await this._displayLease.release(); } catch { /* ignore */ }
+      this._displayLease = null;
+    }
+    this._display = null;
+    this._displayNum = null;
+    this._cdpPort = null;
+    this._cdpWsUrl = null;
+    this._vncPort = null;
+    this._env = null;
+    this._info = null;
+  }
+
+  // ── Capabilities & screenshots ────────────────────────────
+
+  async getCapabilities() {
+    const d = this._deps;
+    return {
+      desktopScreenshot: Boolean(await d.which('import')),
+      pageScreenshot: true,
+      vnc: Boolean(this._info?.vnc),
+      nativeInput: true,
+    };
+  }
+
+  /**
+   * @param {{ space?: 'desktop'|'page' }} [opts]
+   */
+  async screenshot({ space = 'desktop' } = {}) {
+    if (space === 'page') return this._pageScreenshot();
+    const d = this._deps;
+    const importPath = await d.which('import');
+    if (!importPath) throw new CapabilityError('imagemagick', INSTALL_HINTS.imagemagick);
+    const png = await d.execFileBuffer(importPath, ['-window', 'root', 'png:-'], { env: this._env });
+    return {
+      screenshot: `data:image/png;base64,${Buffer.from(png).toString('base64')}`,
+      coordinateSpace: 'desktop',
+      width: this.screenWidth,
+      height: this.screenHeight,
+      dpr: 1,
+    };
+  }
+
+  async _pageScreenshot() {
+    if (!this._cdpPort) throw new Error('provider not started');
+    const pages = await this._deps.fetchJson(`http://127.0.0.1:${this._cdpPort}/json`);
+    const page = Array.isArray(pages) ? pages.find(p => p.type === 'page') || pages[0] : null;
+    if (!page) throw new Error('No open pages for screenshot');
+    const { default: WebSocket } = await import('ws');
+    const data = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(page.webSocketDebuggerUrl);
+      const timer = setTimeout(() => { ws.close(); reject(new Error('Screenshot timed out')); }, 10000);
+      ws.on('open', () => ws.send(JSON.stringify({ id: 1, method: 'Page.captureScreenshot', params: { format: 'png' } })));
+      ws.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.id !== 1) return;
+        clearTimeout(timer);
+        ws.close();
+        if (msg.error) reject(new Error(msg.error.message)); else resolve(msg.result.data);
+      });
+      ws.on('error', (err) => { clearTimeout(timer); reject(err); });
+    });
+    return {
+      screenshot: `data:image/png;base64,${data}`,
+      coordinateSpace: 'page',
+      width: this.screenWidth,
+      height: this.screenHeight,
+      dpr: 1,
+    };
+  }
+
+  // ── Native input via xdotool ──────────────────────────────
+
+  _btn(button) {
+    return { left: '1', middle: '2', right: '3' }[button] || '1';
+  }
 
   async mouseMove(x, y) {
     await this._xdotool(['mousemove', '--', String(Math.round(x)), String(Math.round(y))]);
     return { success: true };
   }
 
-  async mouseClick(x, y, button = 'left') {
-    const btn = { left: '1', right: '3', middle: '2' }[button] || '1';
+  async mouseDown(x, y, button = 'left') {
     await this._xdotool(['mousemove', '--', String(Math.round(x)), String(Math.round(y))]);
-    await this._xdotool(['click', btn]);
+    await this._xdotool(['mousedown', this._btn(button)]);
+    return { success: true };
+  }
+
+  async mouseUp(button = 'left') {
+    await this._xdotool(['mouseup', this._btn(button)]);
+    return { success: true };
+  }
+
+  async mouseClick(x, y, button = 'left') {
+    await this._xdotool(['mousemove', '--', String(Math.round(x)), String(Math.round(y))]);
+    await this._xdotool(['click', this._btn(button)]);
     return { success: true };
   }
 
   async mouseDoubleClick(x, y, button = 'left') {
-    const btn = { left: '1', right: '3', middle: '2' }[button] || '1';
     await this._xdotool(['mousemove', '--', String(Math.round(x)), String(Math.round(y))]);
-    await this._xdotool(['click', '--repeat', '2', '--delay', '50', btn]);
-    return { success: true };
-  }
-
-  async mouseDrag(startX, startY, endX, endY) {
-    await this._xdotool([
-      'mousemove', '--', String(Math.round(startX)), String(Math.round(startY)),
-    ]);
-    await this._xdotool(['mousedown', '1']);
-    await this._xdotool([
-      'mousemove', '--', String(Math.round(endX)), String(Math.round(endY)),
-    ]);
-    await this._xdotool(['mouseup', '1']);
+    await this._xdotool(['click', '--repeat', '2', '--delay', '50', this._btn(button)]);
     return { success: true };
   }
 
   async scroll(x, y, direction, amount = 3) {
     await this._xdotool(['mousemove', '--', String(Math.round(x)), String(Math.round(y))]);
     const btn = direction === 'up' ? '4' : '5';
-    await this._xdotool(['click', '--repeat', String(amount), '--delay', '50', btn]);
+    await this._xdotool(['click', '--repeat', String(Math.max(1, Math.round(amount))), '--delay', '50', btn]);
     return { success: true };
   }
 
+  /** Desktop key press; accepts Puppeteer/W3C names ('Enter', 'Control+Shift+ArrowLeft'). */
   async pressKey(key) {
-    await this._xdotool(['key', key]);
+    await this._xdotool(['key', '--clearmodifiers', normalizeXdoKey(key)]);
     return { success: true };
   }
 
   async typeText(text) {
-    // Type in chunks to avoid buffer issues
     const CHUNK = 50;
     for (let i = 0; i < text.length; i += CHUNK) {
-      const chunk = text.substring(i, i + CHUNK);
-      await this._xdotool(['type', '--delay', '12', '--clearmodifiers', chunk]);
+      await this._xdotool(['type', '--delay', '12', '--clearmodifiers', '--', text.substring(i, i + CHUNK)]);
     }
     return { success: true };
   }
 
   async getCursorPosition() {
     const { stdout } = await this._xdotool(['getmouselocation', '--shell']);
-    const x = parseInt(stdout.match(/X=(\d+)/)?.[1] || '0', 10);
-    const y = parseInt(stdout.match(/Y=(\d+)/)?.[1] || '0', 10);
-    return { x, y };
+    return {
+      x: parseInt(stdout.match(/X=(\d+)/)?.[1] || '0', 10),
+      y: parseInt(stdout.match(/Y=(\d+)/)?.[1] || '0', 10),
+    };
   }
 
   async getScreenSize() {
     return { width: this.screenWidth, height: this.screenHeight };
   }
 
-  // ── Internal helpers ──────────────────────────────────────
-
-  async _xdotool(args) {
-    return execAsync('xdotool', args, this._env);
-  }
-
-  async _findChrome() {
-    const candidates = [
-      'chromium-browser',
-      'chromium',
-      'google-chrome',
-      'google-chrome-stable',
-    ];
-    for (const name of candidates) {
-      try {
-        const { stdout } = await execAsync('which', [name], this._env);
-        if (stdout) return stdout;
-      } catch { /* not found */ }
-    }
-    throw new Error(
-      'Chrome/Chromium not found. Install with: apt-get install chromium ' +
-      'or pass chromePath option.'
-    );
+  _xdotool(args) {
+    if (!this._env) throw new Error('provider not started');
+    return this._deps.execFile('xdotool', args, { env: this._env });
   }
 }
 
