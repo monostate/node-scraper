@@ -113,3 +113,5 @@ bin/lightpanda
 bin/lightpanda-*
 lightpanda-*
 !lightpanda-server.js
+# superpowers plan workspaces (scratch)
+.superpowers/
