@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
 import browserPool, { buildLaunchArgs } from './browser-pool.js';
 import { redactUrl, SENSITIVE_FIELD_RE } from './redact.js';
@@ -30,7 +31,16 @@ export const ACTION_KINDS = Object.freeze({
 const CHECKPOINT_NOT_TRANSFERABLE = Object.freeze(['indexedDB', 'serviceWorkers', 'openTabs', 'inFlightRequests', 'history']);
 const SENSITIVE_AUTOCOMPLETE = ['one-time-code', 'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'new-password', 'current-password'];
 
-export class BrowserSession {
+const frameIds = new WeakMap();
+let frameCounter = 0;
+function frameIdOf(frame) {
+  if (!frame) return null;
+  let id = frameIds.get(frame);
+  if (!id) { id = `f${++frameCounter}`; frameIds.set(frame, id); }
+  return id;
+}
+
+export class BrowserSession extends EventEmitter {
   /**
    * @param {object} options
    * @param {'headless'|'chrome'|'visual'|'auto'|'computer-use'} options.mode - 'headless' (LightPanda), 'chrome' (pooled headless Chrome), 'visual' (Chrome visible), 'auto' (LP with Chrome fallback), 'computer-use' (provider with Xvfb+VNC)
@@ -51,6 +61,7 @@ export class BrowserSession {
    * @param {import('./computer-use-provider.js').ComputerUseProvider} options.provider - Required for computer-use mode
    */
   constructor(options = {}) {
+    super();
     this.mode = options.mode || 'auto';
     this.activeBackend = null; // 'lightpanda' | 'chrome' | 'computer-use'
     this.timeout = options.timeout || 15000;
@@ -71,6 +82,10 @@ export class BrowserSession {
     this._dialogHandler = options.dialogHandler || null;
     this._dialogs = [];
     this._attachedPages = new WeakSet();
+    this._activeFrame = null;      // Frame selected with useFrame(), null = main frame
+    this._pages = [];              // pages this session owns (initial + popups)
+    this._targetListener = null;
+    this._newPageWaiters = [];
 
     this.browser = null;
     this.context = null;
@@ -112,6 +127,7 @@ export class BrowserSession {
     }
 
     this._connected = true;
+    this._trackPages();
     return this;
   }
 
@@ -226,10 +242,11 @@ export class BrowserSession {
     this._ensureConnected();
     let dispatched = false;
     try {
-      await this.page.waitForSelector(selector, { timeout: options.timeout || this.timeout });
+      const target = this._stateTarget();
+      await target.waitForSelector(selector, { timeout: options.timeout || this.timeout });
       const urlBefore = this.page.url();
       dispatched = true;
-      await this.page.click(selector);
+      await target.click(selector);
 
       // Wait briefly for a navigation the click may have started. A timeout
       // means "no navigation happened" (fine); any other error means the
@@ -282,13 +299,14 @@ export class BrowserSession {
     this._ensureConnected();
     let dispatched = false;
     try {
-      await this.page.waitForSelector(selector, { timeout: options.timeout || this.timeout });
+      const target = this._stateTarget();
+      await target.waitForSelector(selector, { timeout: options.timeout || this.timeout });
       dispatched = true;
       if (options.clear) {
-        await this.page.click(selector, { clickCount: 3 });
+        await target.click(selector, { clickCount: 3 });
         await this.page.keyboard.press('Backspace');
       }
-      await this.page.type(selector, text, { delay: options.delay || 0 });
+      await target.type(selector, text, { delay: options.delay || 0 });
       this._logAction('type', { selector, text });
       return { success: true, outcome: 'ok' };
     } catch (err) {
@@ -308,7 +326,7 @@ export class BrowserSession {
   async scroll(direction = 'down', amount = 500) {
     this._ensureConnected();
     const deltaY = direction === 'up' ? -amount : amount;
-    await this.page.evaluate((dy) => window.scrollBy(0, dy), deltaY);
+    await this._stateTarget().evaluate((dy) => window.scrollBy(0, dy), deltaY);
     this._logAction('scroll', { direction, amount });
     return { success: true, outcome: 'ok' };
   }
@@ -324,17 +342,19 @@ export class BrowserSession {
       throw new Error('hover() not supported in LightPanda mode');
     }
 
-    await this.page.waitForSelector(selector, { timeout: this.timeout });
-    await this.page.hover(selector);
+    const target = this._stateTarget();
+    await target.waitForSelector(selector, { timeout: this.timeout });
+    await target.hover(selector);
     this._logAction('hover', { selector });
     return { success: true, outcome: 'ok' };
   }
 
   async select(selector, ...values) {
     this._ensureConnected();
-    await this.page.waitForSelector(selector, { timeout: this.timeout });
+    const target = this._stateTarget();
+    await target.waitForSelector(selector, { timeout: this.timeout });
     try {
-      await this.page.select(selector, ...values);
+      await target.select(selector, ...values);
     } catch (err) {
       const uncertainReason = `error_after_dispatch:${err.message}`;
       this._logAction('select', { selector, outcome: 'uncertain', uncertainReason });
@@ -362,7 +382,7 @@ export class BrowserSession {
 
   async extractContent() {
     this._ensureConnected();
-    return this.page.evaluate(() => {
+    return this._stateTarget().evaluate(() => {
       const title = document.title;
       const metaDescription = document.querySelector('meta[name="description"]')?.content || '';
       const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
@@ -385,13 +405,139 @@ export class BrowserSession {
 
   async evaluate(fn, ...args) {
     this._ensureConnected();
-    return this.page.evaluate(fn, ...args);
+    return this._stateTarget().evaluate(fn, ...args);
   }
 
   async waitFor(selector, timeout) {
     this._ensureConnected();
-    await this.page.waitForSelector(selector, { timeout: timeout || this.timeout });
-    return { success: true };
+    await this._stateTarget().waitForSelector(selector, { timeout: timeout || this.timeout });
+    return { success: true, outcome: 'ok' };
+  }
+
+  // ── Frames, shadow roots, tabs ──────────────────────────────
+
+  /** All frames of the current page: { id, name, url, parentId, isMain }. */
+  async frames() {
+    this._ensureConnected();
+    const main = this.page.mainFrame();
+    return this.page.frames().filter(f => !f.isDetached()).map(f => ({
+      id: frameIdOf(f),
+      name: f.name() || null,
+      url: f.url(),
+      parentId: frameIdOf(f.parentFrame()),
+      isMain: f === main,
+    }));
+  }
+
+  /**
+   * Route selector-based actions, evaluate() and getPageState() into a frame.
+   * @param {string|((frame: { id: string, name: string|null, url: string }) => boolean)} target frame id, name, URL substring, or predicate
+   */
+  async useFrame(target) {
+    this._ensureConnected();
+    const main = this.page.mainFrame();
+    const match = this.page.frames().find((f) => {
+      if (f.isDetached()) return false;
+      const info = { id: frameIdOf(f), name: f.name() || null, url: f.url(), isMain: f === main };
+      if (typeof target === 'function') return Boolean(target(info));
+      return info.id === target || (info.name && info.name === target) || (target && info.url.includes(target));
+    });
+    if (!match) throw new Error(`frame not found: ${typeof target === 'function' ? '<predicate>' : target}`);
+    this._activeFrame = match === main ? null : match;
+    this._logAction('useFrame', { frame: frameIdOf(match), url: match.url() });
+    return { id: frameIdOf(match), name: match.name() || null, url: match.url(), isMain: match === main };
+  }
+
+  useMainFrame() {
+    this._activeFrame = null;
+    return this;
+  }
+
+  /** Pages (tabs) this session owns: { index, url, title, active }. */
+  async pages() {
+    this._pruneClosedPages();
+    const out = [];
+    for (let i = 0; i < this._pages.length; i++) {
+      const p = this._pages[i];
+      let title = '';
+      try { title = await p.title(); } catch { /* closed mid-way */ }
+      out.push({ index: i, url: p.url(), title, active: p === this.page });
+    }
+    return out;
+  }
+
+  /** Make the page at `index` (from pages()) the active one. */
+  async usePage(index) {
+    this._pruneClosedPages();
+    const page = this._pages[index];
+    if (!page) throw new Error(`page not found: index ${index}`);
+    this.page = page;
+    this._activeFrame = null;
+    try { await page.bringToFront(); } catch { /* not supported on every engine */ }
+    this._logAction('usePage', { index, url: page.url() });
+    return { index, url: page.url() };
+  }
+
+  /**
+   * Resolve when a new page (popup / target=_blank) opens for this session.
+   * Call it before the action that opens the page (Promise.all pattern).
+   * @param {{ timeout?: number }} [opts]
+   */
+  waitForNewPage({ timeout = this.timeout } = {}) {
+    this._ensureConnected();
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        this._newPageWaiters = this._newPageWaiters.filter(w => w !== waiter);
+        reject(new Error(`timed out after ${timeout}ms waiting for a new page`));
+      }, timeout);
+      this._newPageWaiters.push(waiter);
+    });
+  }
+
+  _trackPages() {
+    if (this.page && !this._pages.includes(this.page)) this._pages.push(this.page);
+    const scope = this.context ?? this.browser;
+    if (!scope || this._targetListener) return;
+    this._targetListener = async (target) => {
+      try {
+        if (target.type() !== 'page') return;
+        const page = await target.page();
+        if (!page || this._pages.includes(page)) return;
+        if (!this.context) {
+          // Shared browser: only adopt pages opened from one of ours.
+          const opener = target.opener?.();
+          const ours = opener && this._pages.some(p => p.target?.() === opener);
+          if (!ours) return;
+        }
+        this._pages.push(page);
+        this._attachPage(page);
+        if (page.url() === '' || page.url() === 'about:blank') {
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: this.timeout }).catch(() => {});
+        }
+        const info = { index: this._pages.indexOf(page), url: page.url() };
+        this._logAction('newPage', info);
+        this.emit('newPage', info);
+        const waiters = this._newPageWaiters.splice(0);
+        for (const w of waiters) { clearTimeout(w.timer); w.resolve(info); }
+      } catch (err) {
+        this._log(`new page tracking failed: ${err.message}`);
+      }
+    };
+    scope.on('targetcreated', this._targetListener);
+  }
+
+  _untrackPages() {
+    const scope = this.context ?? this.browser;
+    if (scope && this._targetListener) {
+      try { scope.off('targetcreated', this._targetListener); } catch { /* ignore */ }
+    }
+    this._targetListener = null;
+    for (const w of this._newPageWaiters.splice(0)) { clearTimeout(w.timer); w.reject(new Error('session closed')); }
+  }
+
+  _pruneClosedPages() {
+    this._pages = this._pages.filter(p => { try { return !p.isClosed(); } catch { return false; } });
   }
 
   // ── Screenshot ──────────────────────────────────────────────
@@ -446,6 +592,9 @@ export class BrowserSession {
       refAttr: DEFAULT_REF_ATTR,
     });
 
+    for (const el of collected.elements) {
+      if (el.inShadow && !el.selector.startsWith('pierce/')) el.selector = `pierce/${el.selector}`;
+    }
     const state = {
       url: collected.url,
       title: collected.title,
@@ -458,6 +607,7 @@ export class BrowserSession {
         total: collected.elementsTotal,
       },
       coordinateSpace: 'page',
+      frame: this._frameInfo(),
     };
     // Compatibility alias for 2.x callers (same array, not a copy).
     state.interactiveElements = state.elements;
@@ -478,7 +628,15 @@ export class BrowserSession {
 
   /** Where selector-based actions and state collection run (main page until frames are selected). */
   _stateTarget() {
+    if (this._activeFrame && this._activeFrame.isDetached()) this._activeFrame = null;
     return this._activeFrame ?? this.page;
+  }
+
+  _frameInfo() {
+    const main = this.page?.mainFrame?.();
+    const f = this._activeFrame ?? main;
+    if (!f) return null;
+    return { id: frameIdOf(f), name: f.name() || null, url: f.url(), isMain: f === main };
   }
 
   // ── Dialogs ─────────────────────────────────────────────────
@@ -854,6 +1012,7 @@ export class BrowserSession {
     }
 
     // Close LP page (keep server alive for potential reuse)
+    this._untrackPages();
     try {
       if (this.page && !this.page.isClosed()) await this.page.close();
       if (this.context) await this.context.close();
@@ -861,8 +1020,11 @@ export class BrowserSession {
     } catch {
       // ignore cleanup errors
     }
+    this._pages = [];
+    this._activeFrame = null;
 
     await this._connectChrome();
+    this._trackPages();
 
     const { restored, skipped } = await this.restore(cp);
     this._logAction('fallback', {
@@ -893,6 +1055,12 @@ export class BrowserSession {
   // ── Cleanup ─────────────────────────────────────────────────
 
   async close() {
+    this._untrackPages();
+    for (const p of this._pages) {
+      try { if (!p.isClosed()) await p.close(); } catch { /* ignore */ }
+    }
+    this._pages = [];
+    this._activeFrame = null;
     try {
       if (this.page && !this.page.isClosed()) await this.page.close();
     } catch { /* ignore */ }
