@@ -207,6 +207,11 @@ caps.missing; // [{ capability: 'xdotool', install: 'apt-get install xdotool' },
   sandbox start produces an error that says exactly that.
 - `BNCA_CHROME_PATH` / `PUPPETEER_EXECUTABLE_PATH` / `CHROME_PATH` select the
   Chrome binary; `LIGHTPANDA_PATH` selects Lightpanda.
+- Chrome launch options are **process-wide**: there is one shared pool, so
+  `noSandbox`/`disableWebSecurity` passed to any scraper or session
+  reconfigure it for later launches. Browsers already running keep their
+  flags; the pool emits a `warn` event (and one console line) when flags
+  change while browsers exist. Decide these once, at startup.
 - The library registers no `SIGTERM`/`SIGINT` handlers. Call
   `scraper.cleanup()` / `browserPool.shutdown()` / `stopLightPandaServer()`
   from yours.

@@ -20,6 +20,11 @@ const RICH_SPA_HTML = makeHTML(
 
 const PDF_BYTES = Buffer.from('%PDF-1.4 fake pdf content here for testing magic byte detection');
 
+// Public websites are optional compatibility probes, never a required test:
+// their markup drifts (example.com dropped its <h1> in 2026) and CI must not
+// depend on them. Opt in with BNCA_REAL_SITES=1.
+const REAL_SITES_SKIP = process.env.BNCA_REAL_SITES ? false : 'public-site probes: set BNCA_REAL_SITES=1 to run';
+
 // ─── 1. Fallback Chain / Load Balancing ─────────────────────────────────────
 
 describe('Fallback Chain', () => {
@@ -745,7 +750,7 @@ describe('Screenshot Methods', () => {
 
 // ─── 13. Screenshot Integration (live) ─────────────────────────────────────
 
-describe('Screenshot Integration', () => {
+describe('Screenshot Integration', { skip: REAL_SITES_SKIP }, () => {
   let scraper;
 
   beforeEach(() => {
@@ -783,7 +788,7 @@ describe('Screenshot Integration', () => {
 
 // ─── 14. Integration: Live Network ──────────────────────────────────────────
 
-describe('Integration: Live Network', () => {
+describe('Integration: Live Network', { skip: REAL_SITES_SKIP }, () => {
   let scraper;
 
   beforeEach(() => {
@@ -803,7 +808,7 @@ describe('Integration: Live Network', () => {
 
 // ─── 15. Real Site Scraping: Simple HTML ────────────────────────────────────
 
-describe('Real Sites: Simple HTML (should use direct-fetch)', () => {
+describe('Real Sites: Simple HTML (should use direct-fetch)', { skip: REAL_SITES_SKIP }, () => {
   let scraper;
 
   beforeEach(() => {
@@ -848,7 +853,7 @@ describe('Real Sites: Simple HTML (should use direct-fetch)', () => {
 
 // ─── 16. Real Site Scraping: JS-Heavy / SPA Detection ──────────────────────
 
-describe('Real Sites: JS-Heavy (should detect browser requirement)', () => {
+describe('Real Sites: JS-Heavy (should detect browser requirement)', { skip: REAL_SITES_SKIP }, () => {
   let scraper;
 
   beforeEach(() => {
@@ -896,7 +901,7 @@ describe('Real Sites: JS-Heavy (should detect browser requirement)', () => {
 
 // ─── 17. Real Site Scraping: Method Override on Real Sites ─────────────────
 
-describe('Real Sites: Forced Method Override', () => {
+describe('Real Sites: Forced Method Override', { skip: REAL_SITES_SKIP }, () => {
   let scraper;
 
   beforeEach(() => {
@@ -949,7 +954,7 @@ describe('Real Sites: Forced Method Override', () => {
 
 // ─── 18. Real Site Scraping: Browser Detection Accuracy ────────────────────
 
-describe('Real Sites: Browser Detection Accuracy', () => {
+describe('Real Sites: Browser Detection Accuracy', { skip: REAL_SITES_SKIP }, () => {
   let scraper;
 
   beforeEach(() => {

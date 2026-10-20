@@ -46,6 +46,7 @@ export class BNCASmartScraper extends EventEmitter {
     };
     
     this.browser = null;
+    this._applyLaunchOptions(this.options);
     this.stats = {
       directFetch: { attempts: 0, successes: 0 },
       lightpanda: { attempts: 0, successes: 0 },
@@ -319,6 +320,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     config.deadline = deadline;
     config.signal = deadline.signal;
     const trace = new Trace({ operation: 'scrape', url });
+    this._applyLaunchOptions(options);
     const fallbackChain = [];
     const requestedMethod = config.method;
     const isForced = Boolean(requestedMethod && requestedMethod !== 'auto');
@@ -473,6 +475,35 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         trace: record,
       };
     }
+  }
+
+  /**
+   * Chrome launch options are process-wide (one shared pool). Apply the
+   * scraper's/call's noSandbox / disableWebSecurity so they take effect.
+   */
+  _applyLaunchOptions(options = {}) {
+    const launch = {};
+    if (options.noSandbox !== undefined) launch.noSandbox = Boolean(options.noSandbox);
+    if (options.disableWebSecurity !== undefined) launch.disableWebSecurity = Boolean(options.disableWebSecurity);
+    if (Object.keys(launch).length > 0) browserPool.configure({ launch });
+  }
+
+  /** Chrome CLI flags for the sandbox, honouring config, the pool and BNCA_CHROME_NO_SANDBOX. */
+  _sandboxArgs(config = {}) {
+    const noSandbox = config.noSandbox ?? browserPool.launch.noSandbox ?? (process.env.BNCA_CHROME_NO_SANDBOX === '1');
+    return noSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : [];
+  }
+
+  /** Stage result for a budget that is already gone. */
+  _cancelledResult(deadline) {
+    const aborted = deadline?.reason() === 'aborted';
+    return {
+      success: false,
+      transportSuccess: false,
+      cancelled: true,
+      error: aborted ? 'operation aborted' : 'deadline exceeded',
+      errorType: aborted ? 'cancelled' : 'timeout',
+    };
   }
 
   /** Classification of a stage result; engines that return a document are judged on it. */
@@ -794,8 +825,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     try {
       // Get browser from pool (bounded by the remaining budget)
       const deadline = config.deadline instanceof Deadline ? config.deadline : null;
-      const navTimeout = deadline ? deadline.stageTimeout(config.timeout) : config.timeout;
-      browser = await browserPool.getBrowser({ signal: config.signal, timeout: deadline ? deadline.stageTimeout(browserPool.acquireTimeout) : undefined });
+      if (deadline?.expired()) return this._cancelledResult(deadline);
+      browser = await browserPool.getBrowser({ signal: config.signal, timeout: deadline ? Math.max(1, deadline.stageTimeout(browserPool.acquireTimeout)) : undefined });
+      // Queueing may have consumed the budget: never pass 0 (= no timeout) to Puppeteer.
+      if (deadline?.expired()) return this._cancelledResult(deadline);
+      const navTimeout = Math.max(1, deadline ? deadline.stageTimeout(config.timeout) : config.timeout);
       page = await browser.newPage();
       
       // Set user agent and viewport
@@ -813,11 +847,18 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         }
       });
       
-      // Navigate with timeout
-      const response = await page.goto(url, {
-        waitUntil: 'networkidle0',
-        timeout: navTimeout,
-      });
+      // Navigate with timeout, racing the operation's AbortSignal
+      let onAbort = null;
+      const navigation = page.goto(url, { waitUntil: 'networkidle0', timeout: navTimeout });
+      const response = config.signal
+        ? await Promise.race([
+          navigation,
+          new Promise((_, reject) => {
+            onAbort = () => reject(new Error('navigation aborted at the deadline'));
+            if (config.signal.aborted) onAbort(); else config.signal.addEventListener('abort', onAbort, { once: true });
+          }),
+        ]).finally(() => { if (onAbort) config.signal.removeEventListener('abort', onAbort); navigation.catch(() => {}); })
+        : await navigation;
       const httpStatus = response ? response.status() : null;
       const redirectChain = response
         ? response.request().redirectChain().map(r => ({ url: r.url(), status: r.response()?.status() ?? null }))
@@ -1399,8 +1440,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       const args = [
         '--headless=new',
         '--disable-gpu',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
+        ...this._sandboxArgs(config),
         '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
         '--user-agent=' + config.userAgent,
@@ -1417,7 +1457,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       }
       
       return new Promise((resolve) => {
-        const chrome = spawn(chromePath, args, {
+        const chrome = this._spawn(chromePath, args, {
           stdio: ['ignore', 'pipe', 'pipe'],
           detached: false
         });
@@ -1480,8 +1520,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       const args = [
         '--headless=new',
         '--disable-gpu',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
+        ...this._sandboxArgs(config),
         '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
         '--disable-features=TranslateUI',
@@ -1509,7 +1548,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       }
       
       return new Promise((resolve) => {
-        const chrome = spawn(chromePath, args, {
+        const chrome = this._spawn(chromePath, args, {
           stdio: ['ignore', 'pipe', 'pipe'],
           detached: false
         });
@@ -1921,7 +1960,7 @@ export { LocalProvider } from './providers/local-provider.js';
 // Infrastructure exports (v3)
 export { BrowserPool, buildLaunchArgs, PoolClosedError, PoolQueueFullError, PoolAcquireTimeoutError, PoolAbortedError } from './browser-pool.js';
 export { Deadline, DeadlineError } from './deadline.js';
-export { CONTENT_STATUS, classifyContent, stripHtmlToText } from './content-status.js';
+export { CONTENT_STATUS, classifyContent, stripHtmlToText, MIN_USABLE_TEXT_CHARS, SHELL_TEXT_CHARS } from './content-status.js';
 export { findChromePath, CHROME_CANDIDATES } from './chrome-path.js';
 export { checkCapabilities, requireCapability, CapabilityError, INSTALL_HINTS } from './capabilities.js';
 export { Trace } from './telemetry.js';

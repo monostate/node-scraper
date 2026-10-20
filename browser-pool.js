@@ -91,13 +91,30 @@ export class BrowserPool extends EventEmitter {
     this.stats = { created: 0, reused: 0, queued: 0, cleaned: 0, failed: 0 };
   }
 
-  /** Merge limits/launch options at runtime. */
+  /**
+   * Merge limits/launch options at runtime. Launch options are process-wide:
+   * browsers already running keep the flags they were launched with, so a
+   * change while browsers exist emits a 'warn' event (and one console line).
+   */
   configure(partial = {}) {
     if (partial.maxInstances != null) this.maxInstances = partial.maxInstances;
     if (partial.idleTimeout != null) this.idleTimeout = partial.idleTimeout;
     if (partial.maxQueue != null) this.maxQueue = partial.maxQueue;
     if (partial.acquireTimeout != null) this.acquireTimeout = partial.acquireTimeout;
-    if (partial.launch) this.launch = { ...this.launch, ...partial.launch };
+    if (partial.launch) {
+      const changed = ['noSandbox', 'disableWebSecurity', 'executablePath', 'headless']
+        .filter(k => partial.launch[k] !== undefined && partial.launch[k] !== this.launch[k]);
+      this.launch = { ...this.launch, ...partial.launch };
+      const live = this.pool.length + this.pending;
+      if (changed.length > 0 && live > 0) {
+        const message = `browser pool launch options changed (${changed.join(', ')}) while ${live} browser(s) exist; running browsers keep their old flags — launch options are process-wide`;
+        this.emit('warn', { message, changed });
+        if (!this._warnedLaunchChange) {
+          this._warnedLaunchChange = true;
+          console.warn(`[node-scraper] ${message}`);
+        }
+      }
+    }
     return this;
   }
 
@@ -320,11 +337,11 @@ export class BrowserPool extends EventEmitter {
       const isIdle = !this.busyBrowsers.has(browser.instance);
       if (isIdle && now - browser.lastUsed > this.idleTimeout) toRemove.push(browser);
     }
-    for (const browser of toRemove) {
-      this.removeBrowser(browser);
-      await this._closeInstance(browser.instance);
-      this.stats.cleaned++;
-    }
+    // Take every doomed browser out of the pool before the first await so a
+    // concurrent getBrowser() can never be handed one that is about to close.
+    for (const browser of toRemove) this.removeBrowser(browser);
+    this.stats.cleaned += toRemove.length;
+    await Promise.all(toRemove.map(browser => this._closeInstance(browser.instance)));
     if (this.pool.length > 0) this._scheduleCleanup();
   }
 

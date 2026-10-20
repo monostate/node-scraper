@@ -49,3 +49,18 @@ describe('redactErrorMessage', () => {
   it('passes ordinary messages through', () => assert.equal(redactErrorMessage('Timeout after 5000ms'), 'Timeout after 5000ms'));
   it('handles non-string input', () => assert.equal(redactErrorMessage(undefined), ''));
 });
+
+describe('review fixes: fragments and bearer tokens', () => {
+  it('redactUrl masks sensitive keys in the URL fragment (OAuth implicit callbacks)', () => {
+    const out = redactUrl('https://app.example/cb#access_token=SECRET&state=x&id_token=ID');
+    assert.doesNotMatch(out, /SECRET|=ID/);
+    assert.match(out, /access_token=%5Bredacted%5D|access_token=\[redacted\]/);
+    assert.match(out, /state=x/);
+    assert.equal(redactUrl('https://app.example/page#section-2'), 'https://app.example/page#section-2');
+  });
+  it('redactErrorMessage masks bearer tokens', () => {
+    const out = redactErrorMessage('Authorization: Bearer SECRETTOKEN failed');
+    assert.doesNotMatch(out, /SECRETTOKEN/);
+    assert.match(out, /Bearer \[redacted\]/);
+  });
+});

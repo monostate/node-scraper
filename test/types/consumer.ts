@@ -4,7 +4,7 @@ import {
   BNCASmartScraper, smartScrape, createSession, BrowserSession, LocalProvider, ComputerUseProvider,
   BrowserPool, buildLaunchArgs, PoolAcquireTimeoutError, Deadline, DeadlineError, CONTENT_STATUS, classifyContent,
   checkCapabilities, CapabilityError, Trace, redactUrl, isSensitiveField, normalizeXdoKey, LIGHTPANDA_VERSION,
-  installLightpanda, getBrowserPoolStats, ACTION_KIND,
+  installLightpanda, getBrowserPoolStats, ACTION_KIND, MIN_USABLE_TEXT_CHARS, SHELL_TEXT_CHARS,
   type ScrapingResult, type ScrapingOptions, type PageState, type ActionResult, type ProviderInfo, type ProviderScreenshot,
   type Checkpoint, type RestoreResult, type TraceRecord, type CapabilityReport, type SessionGeometry, type DownloadRecord,
   type BrowserSessionOptions, type ContentStatus,
@@ -125,6 +125,8 @@ async function infrastructure(): Promise<void> {
   const key: string = normalizeXdoKey('Enter');
   const v: string = LIGHTPANDA_VERSION;
   const kind: 'safe' | 'mutating' = ACTION_KIND.SAFE;
+  const minChars: number = MIN_USABLE_TEXT_CHARS + SHELL_TEXT_CHARS;
+  void minChars;
   void safe; void sensitive; void key; void v; void kind;
   const inst = await installLightpanda({ skip: true });
   const st: 'installed' | 'present' | 'skipped' | 'unsupported' | 'failed' = inst.status;

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { makeTempDir, removeDir } from './process-util.js';
 import { getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
 import browserPool, { buildLaunchArgs } from './browser-pool.js';
-import { redactUrl, SENSITIVE_FIELD_RE } from './redact.js';
+import { redactUrl, redactErrorMessage, SENSITIVE_FIELD_RE } from './redact.js';
 import { collectPageState, DEFAULT_REF_ATTR } from './page-state.js';
 import { normalizeXdoKey } from './keymap.js';
 import { Deadline } from './deadline.js';
@@ -1447,8 +1447,21 @@ export class BrowserSession extends EventEmitter {
     this._pages = [];
     this._activeFrame = null;
 
-    await this._connectChrome();
-    this._trackPages();
+    try {
+      await this._connectChrome();
+      this._trackPages();
+    } catch (err) {
+      // The old engine is gone and the new one never came: leave the session
+      // honestly disconnected instead of half-alive on a closed page.
+      this._connected = false;
+      this.page = null;
+      this.context = null;
+      this.browser = null;
+      this._chromeBrowser = null;
+      this.activeBackend = null;
+      this._log(`fallback failed: ${err.message}`);
+      throw err;
+    }
 
     const { restored, skipped } = await this.restore(cp);
     this._logAction('fallback', {
@@ -1462,8 +1475,10 @@ export class BrowserSession extends EventEmitter {
   }
 
   async _shouldFallback(error) {
+    // Only 'auto' sessions switch engines on their own. 'headless' asked for
+    // LightPanda, 'computer-use' owns a provider (switching would leak it).
+    if (this.mode !== 'auto') return false;
     if (this.activeBackend === 'chrome') return false;
-    if (this.mode === 'headless') return false; // no auto-fallback in explicit headless mode
 
     const msg = error.message || '';
     return (
@@ -1535,9 +1550,14 @@ export class BrowserSession extends EventEmitter {
     this.deadline.throwIfExpired();
   }
 
-  /** A per-action timeout that never exceeds what is left of the session deadline. */
+  /**
+   * A per-action timeout that never exceeds what is left of the session
+   * deadline. Throws DeadlineError once the budget is gone: Puppeteer treats
+   * timeout 0 as "wait forever", so 0 is never returned.
+   */
   _timeout(ms) {
-    return this.deadline.stageTimeout(ms ?? this.timeout);
+    this.deadline.throwIfExpired();
+    return Math.max(1, this.deadline.stageTimeout(ms ?? this.timeout));
   }
 
   async _getPuppeteer() {
@@ -1569,7 +1589,12 @@ export class BrowserSession extends EventEmitter {
       out.textLength = out.text == null ? 0 : String(out.text).length;
       delete out.text;
     }
+    // A password typed key-by-key would be reconstructable from history.
+    if (typeof out.key === 'string' && !this.recordTypedText && [...out.key].length === 1) out.key = '[char]';
     if (typeof out.url === 'string') out.url = redactUrl(out.url);
+    for (const k of ['uncertainReason', 'error', 'reason']) {
+      if (typeof out[k] === 'string') out[k] = redactErrorMessage(out[k]);
+    }
     return out;
   }
 

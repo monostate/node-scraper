@@ -43,7 +43,7 @@ capabilities) and the Lightpanda 1.0 upgrade.
 - Pool could exceed its maximum under concurrent acquisition; queued callers could hang forever; a crashed browser left a dead slot.
 - Sessions sharing a pooled browser could read each other's cookies and storage.
 - Paths with spaces broke binary discovery (`new URL().pathname` → `fileURLToPath`).
-- Duplicate `cleanup()` definition; bulk stats never counted `direct-fetch`.
+- Duplicate `cleanup()` definition; `bulkScrape()` stats never counted `direct-fetch`.
 - Chrome binary discovery is shared (`findChromePath`, honours `BNCA_CHROME_PATH`, `PUPPETEER_EXECUTABLE_PATH`, `CHROME_PATH`).
 
 ### Known behaviour

@@ -13,7 +13,7 @@ const EXPECTED = {
   BrowserPool: 'function', buildLaunchArgs: 'function',
   PoolClosedError: 'function', PoolQueueFullError: 'function', PoolAcquireTimeoutError: 'function', PoolAbortedError: 'function',
   Deadline: 'function', DeadlineError: 'function',
-  CONTENT_STATUS: 'object', classifyContent: 'function',
+  CONTENT_STATUS: 'object', classifyContent: 'function', MIN_USABLE_TEXT_CHARS: 'number', SHELL_TEXT_CHARS: 'number', stripHtmlToText: 'function',
   findChromePath: 'function', checkCapabilities: 'function', CapabilityError: 'function',
   Trace: 'function',
   redactUrl: 'function', redactErrorMessage: 'function', isSensitiveField: 'function',

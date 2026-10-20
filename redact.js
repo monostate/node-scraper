@@ -70,11 +70,28 @@ export function redactUrl(url) {
       changed = true;
     }
   }
+  // OAuth implicit / id_token callbacks carry secrets in the fragment.
+  if (parsed.hash && parsed.hash.includes('=')) {
+    const params = new URLSearchParams(parsed.hash.slice(1));
+    let hashChanged = false;
+    for (const key of [...params.keys()]) {
+      if (QUERY_KEY_SET.has(key.toLowerCase())) {
+        params.set(key, '[redacted]');
+        hashChanged = true;
+      }
+    }
+    if (hashChanged) {
+      parsed.hash = `#${params.toString()}`;
+      changed = true;
+    }
+  }
   return changed ? parsed.toString() : url;
 }
 
 const URL_IN_TEXT_RE = /https?:\/\/[^\s"'<>]+/g;
-const KV_SECRET_RE = /\b(password|passwd|pwd|token|secret|api[_-]?key|key|authorization)\s*[=:]\s*(["']?)[^\s"'&,;]+\2/gi;
+// value part refuses a bare "Bearer" so `Authorization: Bearer <token>` is handled by BEARER_RE
+const KV_SECRET_RE = /\b(password|passwd|pwd|token|secret|api[_-]?key|key|authorization)\s*[=:]\s*(["']?)(?!bearer\b)[^\s"'&,;]+\2/gi;
+const BEARER_RE = /\bbearer\s+[A-Za-z0-9._~+/=-]+/gi;
 
 /**
  * Mask secrets that commonly appear in error messages: URLs with credentials
@@ -85,6 +102,7 @@ export function redactErrorMessage(message) {
   const text = typeof message === 'string' ? message : (message.message ?? String(message));
   return text
     .replace(URL_IN_TEXT_RE, (m) => redactUrl(m))
+    .replace(BEARER_RE, 'Bearer [redacted]')
     .replace(KV_SECRET_RE, (m, k) => `${k}=[redacted]`);
 }
 

@@ -173,3 +173,28 @@ describe('LocalProvider (unit, stubbed processes)', () => {
     await assert.rejects(() => p.start(), /requires Linux/);
   });
 });
+
+describe('LocalProvider child stdio (review fix)', () => {
+  it('ignores stdout, drains stderr and reports its tail in start failures', async () => {
+    const lockDir = await makeTempDir('bnca-lp-locks-');
+    try {
+      let spawnedRef;
+      const { deps, spawned } = makeDeps({
+        waitForHttpOk: async () => {
+          const chrome = spawnedRef.find(c => c.name === '/usr/bin/chromium');
+          chrome.stderr.emit('data', Buffer.from('[1:1:FATAL] cannot open display :42\n'));
+          throw new Error('timed out waiting for http://127.0.0.1:1/json/version');
+        },
+      });
+      spawnedRef = spawned;
+      const p = new LocalProvider({ platform: 'linux', lockDir, chromePath: '/usr/bin/chromium', startTimeoutMs: 300, deps });
+      await assert.rejects(() => p.start(), /cannot open display/);
+      const chrome = spawned.find(c => c.name === '/usr/bin/chromium');
+      assert.deepEqual(chrome.opts.stdio, ['ignore', 'ignore', 'pipe']);
+      const xvfb = spawned.find(c => c.name === 'Xvfb');
+      assert.deepEqual(xvfb.opts.stdio, ['ignore', 'ignore', 'pipe']);
+    } finally {
+      await removeDir(lockDir);
+    }
+  });
+});

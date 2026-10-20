@@ -3,10 +3,16 @@ import assert from 'node:assert/strict';
 import { BrowserSession, createSession } from '../browser-session.js';
 import { getLightPandaServer, stopLightPandaServer } from '../lightpanda-server.js';
 import browserPool from '../browser-pool.js';
+import { startFixtureServer } from './fixtures/server.mjs';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-const EXAMPLE_URL = 'https://example.com';
+// Local fixture instead of a public website: deterministic markup, no network.
+const fx = await startFixtureServer();
+after(async () => { await fx.close(); });
+const EXAMPLE_URL = `${fx.url}/content`;
+const EXAMPLE_HOST = '127.0.0.1';
+const EXAMPLE_TITLE = 'Local article fixture';
 const TIMEOUT = 20000;
 
 function hasLightPanda() {
@@ -69,20 +75,20 @@ describe('Chrome visual mode', { timeout: TIMEOUT }, () => {
   it('navigates to a URL', async () => {
     const result = await session.goto(EXAMPLE_URL);
     assert.equal(result.success, true);
-    assert.ok(result.url.includes('example.com'));
+    assert.ok(result.url.includes(EXAMPLE_HOST));
   });
 
   it('extracts page content', async () => {
     const content = await session.extractContent();
-    assert.ok(content.title.includes('Example'));
-    assert.ok(content.url.includes('example.com'));
-    assert.ok(content.paragraphs.length > 0); // example.com dropped its <h1> in 2026
+    assert.ok(content.title.includes(EXAMPLE_TITLE));
+    assert.ok(content.url.includes(EXAMPLE_HOST));
+    assert.ok(content.paragraphs.length > 0);
     assert.ok(content.bodyText.length > 0);
   });
 
   it('evaluates JavaScript in page context', async () => {
     const result = await session.evaluate(() => document.title);
-    assert.ok(result.includes('Example'));
+    assert.ok(result.includes(EXAMPLE_TITLE));
   });
 
   it('takes a screenshot', async () => {
@@ -101,8 +107,8 @@ describe('Chrome visual mode', { timeout: TIMEOUT }, () => {
 
   it('gets page state for AI', async () => {
     const state = await session.getPageState();
-    assert.ok(state.url.includes('example.com'));
-    assert.ok(state.title.includes('Example'));
+    assert.ok(state.url.includes(EXAMPLE_HOST));
+    assert.ok(state.title.includes(EXAMPLE_TITLE));
     assert.ok(state.text.length > 0);
     assert.ok(Array.isArray(state.interactiveElements));
     assert.equal(state.backend, 'chrome');
@@ -159,18 +165,18 @@ describe('Chrome interactions', { timeout: TIMEOUT }, () => {
 
   it('clicks a link and navigates', async () => {
     await session.goto(EXAMPLE_URL);
-    // example.com has a "More information..." link
+    // the fixture article links to the basic form
     const state = await session.getPageState();
-    const link = state.interactiveElements.find(el => el.type === 'link' && el.text.includes('More information'));
-    if (link) {
-      const result = await session.click(link.selector);
-      assert.equal(result.success, true);
-    }
+    const link = state.interactiveElements.find(el => el.role === 'link' && el.text.includes('Basic form'));
+    assert.ok(link, 'fixture link present in page state');
+    const result = await session.click(link.selector);
+    assert.equal(result.success, true);
+    assert.ok(result.url.endsWith('/forms/basic'));
   });
 
   it('waitFor finds existing elements', async () => {
     await session.goto(EXAMPLE_URL);
-    const result = await session.waitFor('p', 5000); // example.com dropped its <h1> in 2026
+    const result = await session.waitFor('p', 5000);
     assert.equal(result.success, true);
   });
 
@@ -184,7 +190,7 @@ describe('Chrome interactions', { timeout: TIMEOUT }, () => {
   it('executeAction dispatches goto', async () => {
     const result = await session.executeAction({ type: 'goto', url: EXAMPLE_URL });
     assert.equal(result.success, true);
-    assert.ok(result.url.includes('example.com'));
+    assert.ok(result.url.includes(EXAMPLE_HOST));
   });
 
   it('executeAction dispatches scroll', async () => {
@@ -227,7 +233,7 @@ describe('Cookie management', { timeout: TIMEOUT }, () => {
     await browserPool.closeAll();
   });
 
-  it('gets cookies (empty for example.com)', async () => {
+  it('gets cookies (fixture sets qa-session)', async () => {
     const cookies = await session.getCookies();
     assert.ok(Array.isArray(cookies));
   });
@@ -236,7 +242,7 @@ describe('Cookie management', { timeout: TIMEOUT }, () => {
     await session.setCookies([{
       name: 'test_cookie',
       value: 'test_value',
-      domain: 'example.com',
+      domain: '127.0.0.1',
     }]);
 
     const cookies = await session.getCookies();
@@ -269,23 +275,23 @@ describe('LightPanda headless mode', { timeout: TIMEOUT }, () => {
   it('navigates to a URL', { skip: !lpAvailable && 'LightPanda not installed' }, async () => {
     const result = await session.goto(EXAMPLE_URL);
     assert.equal(result.success, true);
-    assert.ok(result.url.includes('example.com'));
+    assert.ok(result.url.includes(EXAMPLE_HOST));
   });
 
   it('extracts page content', { skip: !lpAvailable && 'LightPanda not installed' }, async () => {
     const content = await session.extractContent();
-    assert.ok(content.title.includes('Example'));
-    assert.ok(content.url.includes('example.com'));
+    assert.ok(content.title.includes(EXAMPLE_TITLE));
+    assert.ok(content.url.includes(EXAMPLE_HOST));
   });
 
   it('evaluates JavaScript', { skip: !lpAvailable && 'LightPanda not installed' }, async () => {
     const title = await session.evaluate(() => document.title);
-    assert.ok(title.includes('Example'));
+    assert.ok(title.includes(EXAMPLE_TITLE));
   });
 
   it('gets page state', { skip: !lpAvailable && 'LightPanda not installed' }, async () => {
     const state = await session.getPageState();
-    assert.ok(state.url.includes('example.com'));
+    assert.ok(state.url.includes(EXAMPLE_HOST));
     assert.equal(state.backend, 'lightpanda');
     assert.ok(Array.isArray(state.interactiveElements));
   });
@@ -357,7 +363,7 @@ describe('Auto mode with fallback', { timeout: TIMEOUT * 2 }, () => {
 
     // hover triggers fallback since LP doesn't support mouseMoved
     // After fallback, page reloads so h1 should be available
-    const result = await session.hover('p'); // example.com dropped its <h1> in 2026
+    const result = await session.hover('p');
     assert.equal(result.success, true);
     assert.equal(session.activeBackend, 'chrome');
   });
@@ -372,7 +378,7 @@ describe('Auto mode with fallback', { timeout: TIMEOUT * 2 }, () => {
 
     // URL should still be example.com
     const url = await session.evaluate(() => location.href);
-    assert.ok(url.includes('example.com'));
+    assert.ok(url.includes(EXAMPLE_HOST));
   });
 
   it('preserves cookies after fallback', { skip: !lpAvailable && 'LightPanda not installed' }, async () => {
@@ -383,7 +389,7 @@ describe('Auto mode with fallback', { timeout: TIMEOUT * 2 }, () => {
     await session.setCookies([{
       name: 'session_id',
       value: 'abc123',
-      domain: '.example.com',
+      domain: '127.0.0.1',
       path: '/',
     }]);
 
@@ -420,10 +426,10 @@ describe('Auto mode with fallback', { timeout: TIMEOUT * 2 }, () => {
 
     // All operations should still work
     const content = await session.extractContent();
-    assert.ok(content.title.includes('Example'));
+    assert.ok(content.title.includes(EXAMPLE_TITLE));
 
     const state = await session.getPageState();
-    assert.ok(state.url.includes('example.com'));
+    assert.ok(state.url.includes(EXAMPLE_HOST));
     assert.equal(state.backend, 'chrome');
   });
 
@@ -551,7 +557,7 @@ describe('Multi-step navigation', { timeout: 30000 }, () => {
     // Step 1: Go to example.com
     await session.goto(EXAMPLE_URL);
     let content = await session.extractContent();
-    assert.ok(content.title.includes('Example'));
+    assert.ok(content.title.includes(EXAMPLE_TITLE));
 
     // Step 2: Go to a different page
     await session.goto('https://httpbin.org/html');
@@ -561,7 +567,7 @@ describe('Multi-step navigation', { timeout: 30000 }, () => {
     // Step 3: Go back
     await session.goto(EXAMPLE_URL);
     content = await session.extractContent();
-    assert.ok(content.title.includes('Example'));
+    assert.ok(content.title.includes(EXAMPLE_TITLE));
   });
 
   it('type into httpbin forms page', async () => {
@@ -599,7 +605,7 @@ describe('Multi-step navigation (LightPanda)', { timeout: 30000 }, () => {
     // Step 1
     await session.goto(EXAMPLE_URL);
     let content = await session.extractContent();
-    assert.ok(content.title.includes('Example'));
+    assert.ok(content.title.includes(EXAMPLE_TITLE));
 
     // Step 2
     await session.goto('https://httpbin.org/html');

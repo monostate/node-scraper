@@ -144,6 +144,23 @@ export class LocalProvider extends ComputerUseProvider {
     this._info = null;
     this._starting = null;
     this._stopping = null;
+    this._stderr = {}; // bounded stderr tail per child, for failure messages
+  }
+
+  /** Never let a child block on a full pipe: ignore stdout, drain stderr into a bounded tail. */
+  _spawnChild(name, cmd, args) {
+    const child = this._deps.spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'], env: this._env });
+    child.name = child.name || name;
+    this._stderr[name] = '';
+    child.stderr?.on('data', (chunk) => {
+      this._stderr[name] = (this._stderr[name] + chunk.toString()).slice(-2000);
+    });
+    return child;
+  }
+
+  _tail(name) {
+    const t = (this._stderr[name] || '').trim();
+    return t ? ` | stderr: ${t.split('\n').slice(-3).join(' / ')}` : '';
   }
 
   // ── Lifecycle ─────────────────────────────────────────────
@@ -184,11 +201,11 @@ export class LocalProvider extends ComputerUseProvider {
 
       // 4. Xvfb
       step = 'xvfb';
-      this._xvfbProc = d.spawn('Xvfb', [
+      this._xvfbProc = this._spawnChild('xvfb', 'Xvfb', [
         this._display,
         '-screen', '0', `${this.screenWidth}x${this.screenHeight}x24`,
         '-ac', '-nolisten', 'tcp',
-      ], { stdio: 'pipe', env: this._env });
+      ]);
       cleanup.push(async () => { await d.terminate(this._xvfbProc, { graceMs: 2000 }); this._xvfbProc = null; });
       await this._raceExit(this._xvfbProc, d.waitForPath(`/tmp/.X11-unix/X${this._displayNum}`, { timeoutMs: 5000 }));
 
@@ -218,7 +235,7 @@ export class LocalProvider extends ComputerUseProvider {
         ...this.chromeArgs,
         'about:blank',
       ];
-      this._chromeProc = d.spawn(chromePath, chromeArgs, { stdio: 'pipe', env: this._env });
+      this._chromeProc = this._spawnChild('chrome', chromePath, chromeArgs);
       cleanup.push(async () => { await d.terminate(this._chromeProc, { graceMs: 3000 }); this._chromeProc = null; });
       const versionUrl = `http://127.0.0.1:${this._cdpPort}/json/version`;
       await this._raceExit(this._chromeProc, d.waitForHttpOk(versionUrl, { timeoutMs: this.startTimeoutMs }));
@@ -242,7 +259,7 @@ export class LocalProvider extends ComputerUseProvider {
           ...(loopbackOnly ? ['-localhost'] : ['-listen', bind]),
           ...(password ? ['-passwd', password] : ['-nopw']),
         ];
-        this._vncProc = d.spawn('x11vnc', vncArgs, { stdio: 'pipe', env: this._env });
+        this._vncProc = this._spawnChild('vnc', 'x11vnc', vncArgs);
         cleanup.push(async () => { await d.terminate(this._vncProc, { graceMs: 2000 }); this._vncProc = null; });
         const host = loopbackOnly ? '127.0.0.1' : bind;
         await this._raceExit(this._vncProc, d.waitForTcp(host, this._vncPort, { timeoutMs: 5000 }));
@@ -263,7 +280,7 @@ export class LocalProvider extends ComputerUseProvider {
       return this._info;
     } catch (err) {
       await this._runCleanup(cleanup);
-      const error = new Error(`LocalProvider start failed at ${step}: ${err.message}`);
+      const error = new Error(`LocalProvider start failed at ${step}: ${err.message}${this._tail(step)}`);
       error.step = step;
       error.cause = err;
       if (err instanceof CapabilityError) { error.code = err.code; error.capability = err.capability; error.install = err.install; }
