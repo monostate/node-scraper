@@ -25,7 +25,7 @@ jobs:
       - name: Run tests under a virtual display
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
-          xvfb-run -a -s "-screen 0 1280x800x24" node --test --test-timeout=180000 test/
+          xvfb-run -a -s "-screen 0 1280x800x24" node --test --test-timeout=180000 'test/*.test.mjs'
         env:
           BNCA_CHROME_NO_SANDBOX: "1"
 

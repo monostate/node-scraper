@@ -35,9 +35,9 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "node --test --test-timeout=180000 test/",
+    "test": "node --test --test-timeout=180000 'test/*.test.mjs'",
     "postinstall": "node scripts/install-lightpanda.js",
-    "test:unit": "node --test test/",
+    "test:unit": "node --test 'test/*.test.mjs'",
     "smoke:packed": "bash scripts/smoke-packed.sh"
   },
   "keywords": [

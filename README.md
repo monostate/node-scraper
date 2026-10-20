@@ -236,7 +236,7 @@ them. Traces are redacted.
 ## Development
 
 ```bash
-npm test                      # node --test under a 180s per-file budget (Chrome + Lightpanda + fixtures)
+npm test                      # node --test 'test/*.test.mjs' under a 180s per-file budget (Chrome + Lightpanda + fixtures)
 bash docker/run-linux-tests.sh  # full suite incl. Linux computer-use tests in Docker
 bash scripts/smoke-packed.sh    # pack, install into an empty project, scrape through the tarball
 ```
