@@ -16,7 +16,7 @@ describe('collectPageState (in-page collector)', { timeout: 60000, skip }, () =>
 
   before(async () => {
     fx = await startFixtureServer();
-    browser = await puppeteer.launch({ headless: true });
+    browser = await puppeteer.launch({ headless: true, executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined, args: process.env.BNCA_CHROME_NO_SANDBOX === '1' ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] : [] });
     page = await browser.newPage();
   });
   after(async () => { await browser.close(); await fx.close(); });

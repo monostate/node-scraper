@@ -1,0 +1,9 @@
+{
+  "name": "computer-use-linux-example",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@monostate/node-scraper": "^3.0.0",
+    "puppeteer": "^24.38.0"
+  }
+}

@@ -1,0 +1,8 @@
+node_modules
+bin
+.git
+.superpowers
+test-results
+test/screenshots
+*.tgz
+.DS_Store

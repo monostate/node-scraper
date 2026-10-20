@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  unit:
+    name: Node ${{ matrix.node }} on Ubuntu
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: node scripts/install-lightpanda.js
+      - run: npx puppeteer browsers install chrome
+      - name: Run tests under a virtual display
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
+          xvfb-run -a -s "-screen 0 1280x800x24" node --test --test-timeout=180000 test/
+        env:
+          BNCA_CHROME_NO_SANDBOX: "1"
+
+  linux-docker:
+    name: Docker ${{ matrix.platform }} (computer-use)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build test image
+        run: docker build --platform ${{ matrix.platform }} -f docker/Dockerfile.test -t node-scraper-test .
+      - name: Run suite in the image
+        run: docker run --rm --platform ${{ matrix.platform }} --shm-size=1g node-scraper-test
+
+  packed-smoke:
+    name: Packed tarball smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - run: bash scripts/smoke-packed.sh

@@ -1,0 +1,26 @@
+# Linux test image: system Chromium, Xvfb/xdotool/x11vnc, ImageMagick and the
+# pinned Lightpanda. Runs the whole suite (including the Linux-only
+# computer-use tests) under a virtual display.
+FROM node:22-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      chromium xvfb xdotool x11vnc imagemagick \
+      procps iproute2 ca-certificates curl fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+ENV PUPPETEER_SKIP_DOWNLOAD=1
+RUN npm ci --ignore-scripts --no-audit --no-fund
+
+COPY . .
+RUN node scripts/install-lightpanda.js && ./bin/lightpanda version
+
+# Containers run as root without user namespaces: Chrome's sandbox cannot start.
+ENV BNCA_CHROME_NO_SANDBOX=1 \
+    BNCA_CHROME_PATH=/usr/bin/chromium \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    NODE_OPTIONS=--max-old-space-size=2048
+
+# xvfb-run gives the visual-mode tests a display; LocalProvider tests spawn their own Xvfb.
+CMD ["xvfb-run", "-a", "-s", "-screen 0 1280x800x24", "node", "--test", "--test-timeout=180000", "test/"]

@@ -13,7 +13,7 @@ const skip = !puppeteer && 'Puppeteer not installed';
 class MockProvider extends ComputerUseProvider {
   constructor() { super(); this.calls = []; }
   async start() {
-    this._browser = await puppeteer.launch({ headless: true });
+    this._browser = await puppeteer.launch({ headless: true, executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined, args: process.env.BNCA_CHROME_NO_SANDBOX === '1' ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] : [] });
     return { cdpUrl: this._browser.wsEndpoint(), vncUrl: null, vnc: null, screenSize: { width: 1280, height: 800 } };
   }
   async stop() { await this._browser?.close(); this._browser = null; }
