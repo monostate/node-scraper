@@ -1084,12 +1084,12 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
    * Find Lightpanda binary
    */
   findLightpandaBinary() {
-    // First check the package's bin directory (installed by postinstall script)
-    const packageDir = path.dirname(new URL(import.meta.url).pathname);
-    const packageBinPath = path.join(packageDir, 'bin', 'lightpanda');
+    // Explicit override first, then the package's bin directory (postinstall)
+    const packageBinPath = path.join(__dirname, 'bin', 'lightpanda');
     
     const possiblePaths = [
-      packageBinPath, // Package's bin directory (highest priority)
+      ...(process.env.LIGHTPANDA_PATH ? [process.env.LIGHTPANDA_PATH] : []),
+      packageBinPath, // Package's bin directory
       './lightpanda',
       '../lightpanda',
       './lightpanda/lightpanda',

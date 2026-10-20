@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import { createServer } from 'net';
 import path from 'path';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
 
 class LightPandaServer {
   constructor(binaryPath) {
@@ -114,7 +115,8 @@ class LightPandaServer {
   _findBinary() {
     // Check common locations
     const candidates = [
-      path.join(path.dirname(new URL(import.meta.url).pathname), 'bin', 'lightpanda'),
+      ...(process.env.LIGHTPANDA_PATH ? [process.env.LIGHTPANDA_PATH] : []),
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'bin', 'lightpanda'),
       '/usr/local/bin/lightpanda',
       '/usr/bin/lightpanda',
     ];

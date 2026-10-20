@@ -1,196 +1,216 @@
 #!/usr/bin/env node
+/**
+ * Lightpanda installer — pinned, checksum-verified, atomic.
+ *
+ * Importable (used by tests and by `checkCapabilities`) and runnable as the
+ * package postinstall hook. The postinstall never fails the npm install: it
+ * prints one status line and exits 0. Set BNCA_SKIP_LIGHTPANDA_INSTALL=1 to
+ * opt out, LIGHTPANDA_PATH to point the package at an existing binary.
+ */
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 
-import fs from 'fs';
-import https from 'https';
-import path from 'path';
-import { createWriteStream } from 'fs';
-import { execSync } from 'child_process';
+export const LIGHTPANDA_VERSION = '1.0.1';
 
-const LIGHTPANDA_VERSION = 'v0.2.5';
-const BINARY_DIR = path.join(path.dirname(path.dirname(new URL(import.meta.url).pathname)), 'bin');
-const BINARY_NAME = 'lightpanda';
-const BINARY_PATH = path.join(BINARY_DIR, BINARY_NAME);
+/** SHA-256 of each 1.0.1 release asset (verified 2026-10-20). */
+export const LIGHTPANDA_CHECKSUMS = Object.freeze({
+  'lightpanda-aarch64-macos': 'd4b66ac8484f49d7a49e05b6f9342716c747129527fcbe8ffe36679ffa18dd60',
+  'lightpanda-aarch64-linux': '392ba370c12d9f045c36c1477db8b3e2985942c89532732ef8d1610057db7d5c',
+  'lightpanda-x86_64-linux': '551747e35c51ba107b5d5277eca4b48e077b2a3b40f09a047bf6670448bc35fd',
+  'lightpanda-x86_64-macos': '1fcca0ae7684f470780de611a56e9a8ea612d5ff21e37dbb48905ebac5b918a7',
+});
 
-function detectArch() {
-  const arch = process.arch;
-  if (arch === 'arm64' || arch === 'aarch64') return 'aarch64';
-  if (arch === 'x64' || arch === 'x86_64') return 'x86_64';
-  return arch;
+const PACKAGE_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+export const DEFAULT_BIN_DIR = path.join(PACKAGE_DIR, 'bin');
+export const BINARY_NAME = 'lightpanda';
+
+function isWSL() {
+  try {
+    return /microsoft|wsl/i.test(fs.readFileSync('/proc/version', 'utf8'));
+  } catch {
+    return false;
+  }
 }
 
-// Platform-specific download URLs (matching official Lightpanda releases)
-function getDownloadUrls() {
-  const arch = detectArch();
-  const base = `https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_VERSION}`;
-  return {
-    'darwin': `${base}/lightpanda-${arch}-macos`,
-    'linux': `${base}/lightpanda-${arch}-linux`,
-    'wsl': `${base}/lightpanda-x86_64-linux`
-  };
-}
-
-const DOWNLOAD_URLS = getDownloadUrls();
-
-function detectPlatform() {
-  const platform = process.platform;
-  
-  if (platform === 'darwin') {
-    return 'darwin';
-  }
-  
-  if (platform === 'linux') {
-    return 'linux';
-  }
-  
-  if (platform === 'win32') {
-    // Check if we're running in WSL
-    try {
-      const uname = execSync('uname -r', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-      if (uname.toLowerCase().includes('microsoft') || uname.toLowerCase().includes('wsl')) {
-        console.log('🐧 WSL detected - using Linux binary');
-        return 'wsl';
-      }
-    } catch {
-      // Not in WSL or uname not available
-    }
-    
-    console.log('⚠️  Windows detected. Lightpanda is recommended to run in WSL2.');
-    console.log('   Please install WSL2 and run this package from within WSL2.');
-    console.log('   See: https://docs.microsoft.com/en-us/windows/wsl/install');
-    return null;
-  }
-  
+/** @returns {string|null} release asset name for this platform, or null when unsupported */
+export function assetNameFor({ platform = process.platform, arch = process.arch } = {}) {
+  const archName = arch === 'arm64' || arch === 'aarch64' ? 'aarch64'
+    : arch === 'x64' || arch === 'x86_64' ? 'x86_64'
+      : null;
+  if (!archName) return null;
+  if (platform === 'darwin') return `lightpanda-${archName}-macos`;
+  if (platform === 'linux') return `lightpanda-${archName}-linux`;
+  if (platform === 'win32' && isWSL()) return `lightpanda-${archName}-linux`;
   return null;
 }
 
-async function downloadFile(url, destination) {
-  console.log(`📥 Downloading Lightpanda binary from: ${url}`);
-  
-  return new Promise((resolve, reject) => {
-    const request = https.get(url, (response) => {
-      // Handle redirects
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        return downloadFile(response.headers.location, destination).then(resolve).catch(reject);
+export function downloadUrlFor(asset, version = LIGHTPANDA_VERSION) {
+  return `https://github.com/lightpanda-io/browser/releases/download/${version}/${asset}`;
+}
+
+export async function sha256File(filePath) {
+  const hash = createHash('sha256');
+  await pipeline(fs.createReadStream(filePath), async function* (source) {
+    for await (const chunk of source) hash.update(chunk);
+  });
+  return hash.digest('hex');
+}
+
+/**
+ * Download `url` to `destPath` via a `.part-<pid>` temp file and an atomic rename.
+ * Redirects are followed manually so they can be bounded.
+ */
+export async function download(url, destPath, { maxRedirects = 5, timeoutMs = 180000, fetchImpl = fetch, onProgress } = {}) {
+  const partPath = `${destPath}.part-${process.pid}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`download timed out after ${timeoutMs}ms`)), timeoutMs);
+  try {
+    let current = url;
+    let response = null;
+    for (let i = 0; i <= maxRedirects; i++) {
+      response = await fetchImpl(current, { redirect: 'manual', signal: controller.signal });
+      if (response.status >= 300 && response.status < 400) {
+        const loc = response.headers.get('location');
+        if (!loc) throw new Error(`redirect without location from ${current}`);
+        current = new URL(loc, current).toString();
+        response = null;
+        continue;
       }
-      
-      if (response.statusCode !== 200) {
-        reject(new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`));
-        return;
-      }
-      
-      const fileStream = createWriteStream(destination);
-      const totalSize = parseInt(response.headers['content-length'] || '0');
-      let downloadedSize = 0;
-      
-      response.on('data', (chunk) => {
-        downloadedSize += chunk.length;
-        if (totalSize > 0) {
-          const progress = (downloadedSize / totalSize * 100).toFixed(1);
-          process.stdout.write(`\r⏳ Progress: ${progress}%`);
+      break;
+    }
+    if (!response) throw new Error(`too many redirects (>${maxRedirects}) downloading ${url}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status} downloading ${current}`);
+    if (!response.body) throw new Error(`empty body downloading ${current}`);
+
+    await fsp.mkdir(path.dirname(destPath), { recursive: true });
+    const total = Number(response.headers.get('content-length') || 0);
+    let received = 0;
+    const out = fs.createWriteStream(partPath, { mode: 0o755 });
+    await pipeline(
+      Readable.fromWeb(response.body, { signal: controller.signal }),
+      async function* (source) {
+        for await (const chunk of source) {
+          received += chunk.length;
+          onProgress?.({ received, total });
+          yield chunk;
         }
-      });
-      
-      response.on('end', () => {
-        process.stdout.write('\r✅ Download completed!           \n');
-      });
-      
-      response.pipe(fileStream);
-      
-      fileStream.on('finish', () => {
-        fileStream.close();
-        resolve();
-      });
-      
-      fileStream.on('error', reject);
-    });
-    
-    request.on('error', reject);
-    request.setTimeout(60000, () => {
-      request.destroy();
-      reject(new Error('Download timeout'));
+      },
+      out,
+    );
+    await fsp.rename(partPath, destPath);
+  } catch (err) {
+    await fsp.rm(partPath, { force: true }).catch(() => {});
+    if (controller.signal.aborted) throw controller.signal.reason instanceof Error ? controller.signal.reason : new Error('download aborted');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Run `<binary> version` and return the trimmed stdout (null on any failure). */
+export function binaryVersion(binaryPath) {
+  return new Promise((resolve) => {
+    execFile(binaryPath, ['version'], { timeout: 10000 }, (err, stdout, stderr) => {
+      if (err) return resolve(null);
+      const out = `${stdout || ''}${stderr || ''}`.trim().split('\n')[0]?.trim();
+      resolve(out || null);
     });
   });
 }
 
-async function makeExecutable(filePath) {
+/**
+ * @returns {Promise<{ status: 'installed'|'present'|'skipped'|'unsupported'|'failed', path?: string, version?: string, reason?: string }>}
+ */
+export async function installLightpanda({
+  binDir = DEFAULT_BIN_DIR,
+  version = LIGHTPANDA_VERSION,
+  force = false,
+  skip = process.env.BNCA_SKIP_LIGHTPANDA_INSTALL === '1',
+  platform = process.platform,
+  arch = process.arch,
+  checksums = LIGHTPANDA_CHECKSUMS,
+  urlFor = (asset) => downloadUrlFor(asset, version),
+  healthCheck = binaryVersion,
+  fetchImpl = fetch,
+  log = console.log,
+} = {}) {
+  const binaryPath = path.join(binDir, BINARY_NAME);
+
+  if (skip) {
+    log('lightpanda: install skipped (BNCA_SKIP_LIGHTPANDA_INSTALL=1)');
+    return { status: 'skipped', path: binaryPath, reason: 'BNCA_SKIP_LIGHTPANDA_INSTALL' };
+  }
+
+  const asset = assetNameFor({ platform, arch });
+  if (!asset) {
+    log(`lightpanda: no release asset for ${platform}/${arch}; Lightpanda disabled (Chrome fallback still works)`);
+    return { status: 'unsupported', reason: `${platform}/${arch}` };
+  }
+
+  if (!force && fs.existsSync(binaryPath)) {
+    const existing = await healthCheck(binaryPath);
+    if (existing === version) {
+      await fsp.chmod(binaryPath, 0o755).catch(() => {});
+      log(`lightpanda: present ${binaryPath} (${version})`);
+      return { status: 'present', path: binaryPath, version };
+    }
+    log(`lightpanda: existing binary reports ${existing ?? 'unknown'}; replacing with ${version}`);
+  }
+
+  const expected = checksums[asset];
+  if (!expected) {
+    return { status: 'failed', reason: `no checksum for ${asset}` };
+  }
+
+  const stagingPath = `${binaryPath}.download-${process.pid}`;
   try {
-    await fs.promises.chmod(filePath, 0o755);
-    console.log(`🔧 Made ${filePath} executable`);
-  } catch (error) {
-    console.warn(`⚠️  Warning: Could not make binary executable: ${error.message}`);
+    const url = urlFor(asset);
+    log(`lightpanda: downloading ${url}`);
+    await download(url, stagingPath, { fetchImpl });
+
+    const actual = await sha256File(stagingPath);
+    if (actual !== expected) {
+      await fsp.rm(stagingPath, { force: true });
+      log(`lightpanda: checksum mismatch for ${asset} (expected ${expected.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`);
+      return { status: 'failed', reason: 'checksum_mismatch', path: binaryPath };
+    }
+
+    await fsp.chmod(stagingPath, 0o755);
+    const reported = await healthCheck(stagingPath);
+    if (reported !== version) {
+      await fsp.rm(stagingPath, { force: true });
+      log(`lightpanda: health check failed (binary reports ${reported ?? 'nothing'}, expected ${version})`);
+      return { status: 'failed', reason: 'health_check', path: binaryPath };
+    }
+
+    await fsp.rename(stagingPath, binaryPath);
+    log(`lightpanda: installed ${binaryPath} (${version})`);
+    return { status: 'installed', path: binaryPath, version };
+  } catch (err) {
+    await fsp.rm(stagingPath, { force: true }).catch(() => {});
+    log(`lightpanda: install failed: ${err.message}`);
+    return { status: 'failed', reason: err.message, path: binaryPath };
   }
 }
 
-async function installLightpanda() {
-  try {
-    const platform = detectPlatform();
-    
-    if (!platform) {
-      console.log('   Falling back to Puppeteer for browser-based scraping.');
-      return;
-    }
-    
-    const downloadUrl = DOWNLOAD_URLS[platform];
-    
-    if (!downloadUrl) {
-      console.log(`⚠️  Lightpanda binary not available for platform: ${platform}`);
-      console.log('   Falling back to Puppeteer for browser-based scraping.');
-      return;
-    }
-    
-    // Create bin directory if it doesn't exist
-    if (!fs.existsSync(BINARY_DIR)) {
-      await fs.promises.mkdir(BINARY_DIR, { recursive: true });
-      console.log(`📁 Created directory: ${BINARY_DIR}`);
-    }
-    
-    // Check if binary already exists
-    if (fs.existsSync(BINARY_PATH)) {
-      console.log(`✅ Lightpanda binary already exists at: ${BINARY_PATH}`);
-      await makeExecutable(BINARY_PATH);
-      return;
-    }
-    
-    console.log(`🚀 Installing Lightpanda binary for ${platform}...`);
-    
-    // Download the binary
-    await downloadFile(downloadUrl, BINARY_PATH);
-    
-    // Make executable (all Unix-like systems including WSL)
-    await makeExecutable(BINARY_PATH);
-    
-    // Verify the binary
-    if (fs.existsSync(BINARY_PATH)) {
-      const stats = await fs.promises.stat(BINARY_PATH);
-      console.log(`✅ Lightpanda binary installed successfully!`);
-      console.log(`   Location: ${BINARY_PATH}`);
-      console.log(`   Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-      
-      // Additional WSL information
-      if (platform === 'wsl') {
-        console.log('');
-        console.log('📝 WSL Setup Notes:');
-        console.log('   - Lightpanda binary installed for WSL environment');
-        console.log('   - Ensure your Node.js application runs within WSL2');
-        console.log('   - For best performance, keep files within WSL filesystem');
-      }
-    } else {
-      throw new Error('Binary download verification failed');
-    }
-    
-  } catch (error) {
-    console.error(`❌ Failed to install Lightpanda binary: ${error.message}`);
-    console.log('   The package will fall back to Puppeteer for browser-based scraping.');
-    
-    // Don't fail the installation, just log the issue
-    process.exit(0);
-  }
+// CLI / postinstall entry point
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  const force = process.argv.includes('--force');
+  installLightpanda({ force })
+    .then((r) => {
+      console.log(`lightpanda: ${r.status}${r.path ? ` ${r.path}` : ''}${r.reason ? ` (${r.reason})` : ''}`);
+      if (r.status === 'failed') console.log('   The package will fall back to Chrome/Puppeteer for browser-based scraping.');
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error(`lightpanda: unexpected installer error: ${err.message}`);
+      process.exit(0);
+    });
 }
-
-// Only run if this is the main module (not imported)
-if (import.meta.url === `file://${process.argv[1]}`) {
-  installLightpanda().catch((error) => {
-    console.error('Installation failed:', error);
-    process.exit(0); // Don't fail package installation
-  });
-} 
