@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { promises as fsPromises } from 'fs';
 let PDFParse = null;
 import browserPool from './browser-pool.js';
+import { findChromePath } from './chrome-path.js';
 
 let puppeteer = null;
 try {
@@ -1436,29 +1437,11 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
   }
   
   /**
-   * Find Chrome/Chromium binary path
+   * Find Chrome/Chromium binary path (shared discovery, honours BNCA_CHROME_PATH,
+   * PUPPETEER_EXECUTABLE_PATH and CHROME_PATH).
    */
   async findChromePath() {
-    const chromePaths = process.platform === 'darwin' ? [
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    ] : [
-      '/usr/bin/chromium-browser',
-      '/usr/bin/chromium',
-      '/usr/bin/google-chrome-stable',
-      '/usr/bin/google-chrome',
-    ];
-    
-    for (const path of chromePaths) {
-      try {
-        await fsPromises.access(path);
-        return path;
-      } catch (e) {
-        continue;
-      }
-    }
-    
-    return null;
+    return findChromePath();
   }
   
   /**
