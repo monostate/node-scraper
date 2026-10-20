@@ -1,6 +1,7 @@
 import { getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
 import browserPool, { buildLaunchArgs } from './browser-pool.js';
 import { redactUrl, SENSITIVE_FIELD_RE } from './redact.js';
+import { collectPageState, DEFAULT_REF_ATTR } from './page-state.js';
 
 const FALLBACK_REASONS = {
   SCREENSHOT: 'screenshot_requested',
@@ -40,6 +41,9 @@ export class BrowserSession {
    * @param {boolean} [options.disableWebSecurity] - Disable same-origin policy in Chrome (off by default)
    * @param {number} [options.acquireTimeout=30000] - Max wait for a pooled browser
    * @param {AbortSignal} [options.signal] - Abort connecting/queued acquisition
+   * @param {number} [options.maxStateText=3000] - Default text budget for getPageState()
+   * @param {number} [options.maxStateElements=50] - Default element budget for getPageState()
+   * @param {object|Function} [options.dialogHandler] - { action:'accept'|'dismiss', promptText? } or async (dialog) => decision; default dismisses
    * @param {number} options.timeout - Navigation timeout in ms (default: 15000)
    * @param {string} options.userAgent - Custom user agent
    * @param {string} options.lightpandaPath - Path to LightPanda binary
@@ -62,6 +66,11 @@ export class BrowserSession {
       ...(options.noSandbox !== undefined && { noSandbox: options.noSandbox }),
       ...(options.disableWebSecurity !== undefined && { disableWebSecurity: options.disableWebSecurity }),
     };
+    this.maxStateText = options.maxStateText ?? 3000;
+    this.maxStateElements = options.maxStateElements ?? 50;
+    this._dialogHandler = options.dialogHandler || null;
+    this._dialogs = [];
+    this._attachedPages = new WeakSet();
 
     this.browser = null;
     this.context = null;
@@ -115,6 +124,7 @@ export class BrowserSession {
     this.context = await this.browser.createBrowserContext();
     this.page = await this.context.newPage();
 
+    this._attachPage(this.page);
     await this.page.setUserAgent(this.userAgent);
     this.activeBackend = 'lightpanda';
     this._log('Connected to LightPanda CDP');
@@ -128,6 +138,7 @@ export class BrowserSession {
     // workers never leak between sessions sharing a pooled browser.
     this.context = this.isolate ? await this.browser.createBrowserContext() : null;
     this.page = await (this.context ?? this.browser).newPage();
+    this._attachPage(this.page);
 
     await this.page.setUserAgent(this.userAgent);
     await this.page.setViewport({ width: 1280, height: 800 });
@@ -147,6 +158,7 @@ export class BrowserSession {
       }),
     });
     this.page = await this.browser.newPage();
+    this._attachPage(this.page);
     await this.page.setUserAgent(this.userAgent);
     await this.page.setViewport({ width: 1280, height: 800 });
     this.activeBackend = 'chrome';
@@ -166,6 +178,7 @@ export class BrowserSession {
 
     const pages = await this.browser.pages();
     this.page = pages[0] || await this.browser.newPage();
+    this._attachPage(this.page);
     await this.page.setViewport({
       width: this._providerInfo.screenSize.width,
       height: this._providerInfo.screenSize.height,
@@ -413,81 +426,100 @@ export class BrowserSession {
   // ── AI Agent Interface ──────────────────────────────────────
 
   /**
-   * Returns structured page state for AI decision-making.
-   * Includes interactive elements with selectors for the AI to use.
+   * Structured page state for AI decision-making.
+   *
+   * Elements carry stable refs (`[data-bnca-ref="eN"]` selectors), role,
+   * label, required/disabled/checked/invalid state and bounds; sensitive
+   * values are redacted; limits are configurable and truncation is reported.
+   *
+   * @param {{ includeScreenshot?: boolean, maxText?: number, maxElements?: number, offset?: number, includeValues?: boolean }} [options]
    */
   async getPageState(options = {}) {
     this._ensureConnected();
-
-    const state = await this.page.evaluate(() => {
-      const interactiveElements = [];
-
-      // Buttons
-      document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach((el, i) => {
-        if (el.offsetParent === null) return; // hidden
-        const text = el.textContent?.trim() || el.value || el.getAttribute('aria-label') || '';
-        if (!text) return;
-        interactiveElements.push({
-          type: 'button',
-          text: text.substring(0, 100),
-          selector: el.id ? `#${el.id}` : `button:nth-of-type(${i + 1})`,
-          tag: el.tagName.toLowerCase(),
-        });
-      });
-
-      // Links
-      document.querySelectorAll('a[href]').forEach((el) => {
-        if (el.offsetParent === null) return;
-        const text = el.textContent?.trim();
-        if (!text || text.length < 2) return;
-        interactiveElements.push({
-          type: 'link',
-          text: text.substring(0, 100),
-          href: el.href,
-          selector: el.id ? `#${el.id}` : `a[href="${el.getAttribute('href')}"]`,
-        });
-      });
-
-      // Inputs
-      document.querySelectorAll('input, textarea, select').forEach((el) => {
-        if (el.offsetParent === null || el.type === 'hidden') return;
-        const label = el.getAttribute('aria-label')
-          || el.placeholder
-          || document.querySelector(`label[for="${el.id}"]`)?.textContent?.trim()
-          || el.name
-          || '';
-        interactiveElements.push({
-          type: el.tagName.toLowerCase() === 'select' ? 'select' : 'input',
-          inputType: el.type || 'text',
-          label: label.substring(0, 100),
-          value: el.value?.substring(0, 50) || '',
-          selector: el.id ? `#${el.id}` : `[name="${el.name}"]`,
-          tag: el.tagName.toLowerCase(),
-        });
-      });
-
-      return {
-        url: location.href,
-        title: document.title,
-        text: document.body?.innerText?.substring(0, 3000) || '',
-        interactiveElements: interactiveElements.slice(0, 50),
-      };
+    const target = this._stateTarget();
+    const collected = await target.evaluate(collectPageState, {
+      maxText: options.maxText ?? this.maxStateText,
+      maxElements: options.maxElements ?? this.maxStateElements,
+      offset: options.offset ?? 0,
+      includeValues: options.includeValues ?? true,
+      sensitiveRe: SENSITIVE_FIELD_RE.source,
+      refAttr: DEFAULT_REF_ATTR,
     });
 
-    // Optionally include screenshot
-    if (options.includeScreenshot && this.activeBackend !== 'lightpanda') {
-      const { screenshot } = await this.screenshot();
-      state.screenshot = screenshot;
-    } else if (options.includeScreenshot && this.mode === 'auto') {
-      await this._fallbackToChrome(FALLBACK_REASONS.SCREENSHOT);
-      const { screenshot } = await this.screenshot();
-      state.screenshot = screenshot;
+    const state = {
+      url: collected.url,
+      title: collected.title,
+      text: collected.text,
+      elements: collected.elements,
+      forms: collected.forms,
+      truncated: {
+        text: collected.textTruncated,
+        elements: collected.elementsTruncated,
+        total: collected.elementsTotal,
+      },
+      coordinateSpace: 'page',
+    };
+    // Compatibility alias for 2.x callers (same array, not a copy).
+    state.interactiveElements = state.elements;
+
+    if (options.includeScreenshot) {
+      if (this.activeBackend === 'lightpanda' && this.mode !== 'auto') {
+        state.screenshotError = 'screenshot() not available in headless-only mode (LightPanda has no rendering engine)';
+      } else {
+        const { screenshot } = await this.screenshot({ fullPage: options.fullPage ?? false });
+        state.screenshot = screenshot;
+      }
     }
 
     state.backend = this.activeBackend;
     state.sessionHistory = this.history.slice(-10);
-
     return state;
+  }
+
+  /** Where selector-based actions and state collection run (main page until frames are selected). */
+  _stateTarget() {
+    return this._activeFrame ?? this.page;
+  }
+
+  // ── Dialogs ─────────────────────────────────────────────────
+
+  /**
+   * Decide how JavaScript dialogs (alert/confirm/prompt/beforeunload) are answered.
+   * @param {{ action: 'accept'|'dismiss', promptText?: string } | ((dialog: { type: string, message: string, defaultValue: string }) => Promise<{ action: 'accept'|'dismiss', promptText?: string }>|{ action: 'accept'|'dismiss', promptText?: string })} handler
+   */
+  setDialogHandler(handler) {
+    this._dialogHandler = handler || null;
+    return this;
+  }
+
+  /** Dialogs seen so far: { type, message, defaultValue, action, promptText, at }. */
+  getDialogs() {
+    return this._dialogs.slice();
+  }
+
+  _attachPage(page) {
+    if (!page || this._attachedPages.has(page)) return;
+    this._attachedPages.add(page);
+    page.on('dialog', async (dialog) => {
+      const info = { type: dialog.type(), message: dialog.message(), defaultValue: dialog.defaultValue() };
+      let decision = { action: 'dismiss' };
+      try {
+        const h = this._dialogHandler;
+        if (typeof h === 'function') decision = (await h(info)) || decision;
+        else if (h && typeof h === 'object') decision = h;
+      } catch (err) {
+        this._log(`dialog handler threw: ${err.message}`);
+      }
+      const action = decision.action === 'accept' ? 'accept' : 'dismiss';
+      try {
+        if (action === 'accept') await dialog.accept(decision.promptText);
+        else await dialog.dismiss();
+      } catch (err) {
+        this._log(`dialog ${action} failed: ${err.message}`);
+      }
+      this._dialogs.push({ ...info, action, promptText: action === 'accept' ? decision.promptText ?? null : null, at: Date.now() });
+      this._logAction('dialog', { dialogType: info.type, action });
+    });
   }
 
   /**

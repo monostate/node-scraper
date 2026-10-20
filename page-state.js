@@ -41,11 +41,18 @@ export function collectPageState(opts) {
     }
   }
 
+  // Engines without a layout tree (LightPanda) report no client rects for
+  // anything; fall back to attribute/style-based visibility there.
+  const layoutAvailable = Boolean(document.body && typeof document.body.getClientRects === 'function' && document.body.getClientRects().length > 0);
   function visible(el) {
-    if (el.type === 'hidden') return false;
-    if (!el.getClientRects().length) return false;
-    const cs = getComputedStyle(el);
-    return cs.visibility !== 'hidden' && cs.display !== 'none';
+    if (el.type === 'hidden' || el.hidden) return false;
+    if (layoutAvailable) {
+      if (!el.getClientRects().length) return false;
+    }
+    let cs = null;
+    try { cs = getComputedStyle(el); } catch { /* unsupported */ }
+    if (cs && (cs.visibility === 'hidden' || cs.display === 'none')) return false;
+    return true;
   }
 
   function textOf(el) {
