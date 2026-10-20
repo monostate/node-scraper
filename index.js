@@ -5,8 +5,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fsPromises } from 'fs';
 let PDFParse = null;
+import { EventEmitter } from 'events';
 import browserPool from './browser-pool.js';
 import { findChromePath } from './chrome-path.js';
+import { classifyContent, stripHtmlToText, CONTENT_STATUS } from './content-status.js';
+import { Trace } from './telemetry.js';
 
 let puppeteer = null;
 try {
@@ -29,8 +32,9 @@ const __dirname = path.dirname(__filename);
  * 
  * Performance: 10x+ faster than Firecrawl on average
  */
-export class BNCASmartScraper {
+export class BNCASmartScraper extends EventEmitter {
   constructor(options = {}) {
+    super();
     this.options = {
       timeout: options.timeout || 10000,
       userAgent: options.userAgent || 'Mozilla/5.0 (compatible; BNCA/1.0; +https://github.com/your-org/bnca)',
@@ -276,397 +280,432 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
   }
   
   /**
-   * Main scraping method with intelligent fallback
+   * Main scraping method with intelligent fallback.
+   *
+   * `success` means the transport worked AND the content is usable
+   * (`contentStatus === 'usable'`). Every result carries httpStatus,
+   * finalUrl, redirectChain, engine, contentStatus/contentReasons and a
+   * redacted trace so callers can tell an empty shell or a block page from
+   * real content.
    */
   async scrape(url, options = {}) {
     const startTime = Date.now();
     const config = { ...this.options, ...options };
-    
-    this.log(`🚀 Starting smart scrape for: ${url}`);
-    
-    let result = null;
-    let method = 'unknown';
-    let lastError = null;
+    const trace = new Trace({ operation: 'scrape', url });
     const fallbackChain = [];
-    
-    // Check if a specific method is requested
     const requestedMethod = config.method;
-    const isForced = requestedMethod && requestedMethod !== 'auto';
-    
+    const isForced = Boolean(requestedMethod && requestedMethod !== 'auto');
+
+    this.log(`🚀 Starting smart scrape for: ${url}`);
+
+    const runStage = async (name, fn) => {
+      const stage = trace.stage(name, { engine: name });
+      const result = await fn();
+      stage.end({
+        outcome: result.success ? 'ok' : 'error',
+        reason: result.success ? (result.needsBrowser ? 'needs_browser' : result.contentStatus) : (result.errorType || 'error'),
+        httpStatus: result.httpStatus ?? null,
+        bytesIn: typeof result.size === 'number' ? result.size : (result.html ? result.html.length : null),
+        error: result.success ? undefined : result.error,
+      });
+      return result;
+    };
+
+    const finish = async (result, method, { forced = false } = {}) => {
+      const out = await this._finalize(url, result, method, config, { startTime, fallbackChain: forced ? null : fallbackChain, trace });
+      this.emit('trace', out.trace);
+      return out;
+    };
+
     try {
-      // Check if URL is a PDF (by extension or content-type check)
-      const isPdfUrl = url.toLowerCase().endsWith('.pdf') || 
-                       url.toLowerCase().includes('.pdf?') ||
-                       url.toLowerCase().includes('/pdf/');
-                       
-      if (isPdfUrl) {
+      // PDF by URL (by extension or path)
+      const lower = url.toLowerCase();
+      if (lower.endsWith('.pdf') || lower.includes('.pdf?') || lower.includes('/pdf/')) {
         this.log('  📄 PDF detected, using PDF parser...');
-        result = await this.tryPDFParse(url, config);
-        
-        if (result.success) {
-          method = 'pdf';
+        const pdf = await runStage('pdf', () => this.tryPDFParse(url, config));
+        if (pdf.success) {
           this.log('  ✅ PDF parsing successful');
-          
-          const totalTime = Date.now() - startTime;
-          return {
-            ...result,
-            method,
-            performance: {
-              totalTime,
-              method
-            },
-            stats: this.getStats()
-          };
-        } else {
-          this.log('  ❌ PDF parsing failed');
-          lastError = result.error;
+          return finish(pdf, 'pdf', { forced: true });
         }
+        this.log('  ❌ PDF parsing failed');
       }
-      
-      // Handle forced method requests
+
       if (isForced) {
         this.log(`  🎯 Method forced to: ${requestedMethod}`);
-        
-        switch (requestedMethod) {
-          case 'direct':
-            this.log('  🔄 Attempting direct fetch...');
-            result = await this.tryDirectFetch(url, config);
-            method = 'direct-fetch';
-            break;
-            
-          case 'lightpanda':
-            this.log('  🐼 Attempting Lightpanda...');
-            result = await this.tryLightpanda(url, config);
-            method = 'lightpanda';
-            break;
-            
-          case 'puppeteer':
-            this.log('  🔵 Attempting Puppeteer...');
-            result = await this.tryPuppeteer(url, config);
-            method = 'puppeteer';
-            break;
-            
-          default:
-            return {
-              success: false,
-              error: `Invalid method: ${requestedMethod}. Valid methods are: auto, direct, lightpanda, puppeteer`,
-              method: 'error',
-              errorType: 'service_unavailable',
-              performance: {
-                totalTime: Date.now() - startTime
-              }
-            };
-        }
-        
-        // For forced methods, return immediately with no fallback
-        if (!result.success) {
-          this.log(`  ❌ ${requestedMethod} failed`);
+        const forcedEngines = {
+          direct: ['direct-fetch', () => this.tryDirectFetch(url, config)],
+          lightpanda: ['lightpanda', () => this.tryLightpanda(url, config)],
+          puppeteer: ['puppeteer', () => this.tryPuppeteer(url, config)],
+        };
+        const entry = forcedEngines[requestedMethod];
+        if (!entry) {
+          trace.finish({ outcome: 'error' });
           return {
             success: false,
-            error: result.error || `${requestedMethod} scraping failed`,
-            method,
-            errorType: this.categorizeError(result.error),
-            details: result.error,
-            performance: {
-              totalTime: Date.now() - startTime,
-              method
-            },
-            stats: this.getStats()
+            error: `Invalid method: ${requestedMethod}. Valid methods are: auto, direct, lightpanda, puppeteer`,
+            method: 'error',
+            errorType: 'service_unavailable',
+            performance: { totalTime: Date.now() - startTime },
           };
         }
-        
-        this.log(`  ✅ ${requestedMethod} successful`);
-        const totalTime = Date.now() - startTime;
-        return {
-          ...result,
-          method,
-          performance: {
-            totalTime,
-            method
-          },
-          stats: this.getStats()
-        };
+        const [method, fn] = entry;
+        const result = await runStage(method, fn);
+        this.log(result.success ? `  ✅ ${requestedMethod} successful` : `  ❌ ${requestedMethod} failed`);
+        return finish(result, method, { forced: true });
       }
-      
-      // Step 1: Try direct fetch first (fastest)
+
+      // ── auto: direct fetch → Lightpanda → Puppeteer ──
       this.log('  🔄 Attempting direct fetch...');
       fallbackChain.push('direct-fetch');
-      result = await this.tryDirectFetch(url, config);
-      
-      if (result.success && !result.needsBrowser) {
-        method = 'direct-fetch';
-        this.log('  ✅ Direct fetch successful');
-      } else if (result.isPdf) {
-        // Direct fetch detected a PDF, try PDF parser
+      let result = await runStage('direct-fetch', () => this.tryDirectFetch(url, config));
+      let method = 'direct-fetch';
+
+      if (result.isPdf) {
         this.log('  📄 Direct fetch detected PDF content, using PDF parser...');
-        result = await this.tryPDFParse(url, config);
-        
-        if (result.success) {
-          method = 'pdf';
+        const pdf = await runStage('pdf', () => this.tryPDFParse(url, config));
+        if (pdf.success) {
           this.log('  ✅ PDF parsing successful');
-          
-          const totalTime = Date.now() - startTime;
-          return {
-            ...result,
-            method,
-            performance: {
-              totalTime,
-              method
-            },
-            stats: this.getStats()
-          };
-        } else {
-          this.log('  ❌ PDF parsing failed');
-          lastError = result.error;
+          return finish(pdf, 'pdf', { forced: true });
         }
-      } else {
-        this.log(result.needsBrowser ? '  ⚠️  Browser rendering required' : '  ❌ Direct fetch failed');
-        lastError = result.error;
-        
-        // Step 2: Try Lightpanda (fast browser)
-        this.log('  🐼 Attempting Lightpanda...');
-        fallbackChain.push('lightpanda');
-        result = await this.tryLightpanda(url, config);
-        
-        if (result.success) {
-          method = 'lightpanda';
-          this.log('  ✅ Lightpanda successful');
-        } else {
-          this.log('  ❌ Lightpanda failed, falling back to Puppeteer');
-          lastError = result.error;
-          
-          // Step 3: Fallback to Puppeteer (full browser)
-          this.log('  🔵 Attempting Puppeteer...');
-          fallbackChain.push('puppeteer');
-          result = await this.tryPuppeteer(url, config);
-          
-          if (result.success) {
-            method = 'puppeteer';
-            this.log('  ✅ Puppeteer successful');
-          } else {
-            method = 'failed';
-            this.log('  ❌ All methods failed');
-            lastError = result.error;
-          }
-        }
+        this.log('  ❌ PDF parsing failed');
+        result = pdf;
+        method = 'pdf';
       }
-      
-      const totalTime = Date.now() - startTime;
-      
-      return {
-        ...result,
-        method,
-        performance: {
-          totalTime,
-          method
-        },
-        stats: this.getStats(),
-        // Only include fallbackChain in auto mode
-        ...((!requestedMethod || requestedMethod === 'auto') && { fallbackChain })
-      };
-      
+
+      if (this._isUsable(result) && !result.needsBrowser) {
+        this.log('  ✅ Direct fetch successful');
+        return finish(result, method);
+      }
+
+      // Not usable yet: a shell, a block page, an empty body or a transport
+      // error. A real browser engine often gets through, so try them in order.
+      this.log(result.needsBrowser ? '  ⚠️  Browser rendering required' : `  ❌ Direct fetch not usable (${result.contentStatus || result.errorType || 'error'})`);
+
+      this.log('  🐼 Attempting Lightpanda...');
+      fallbackChain.push('lightpanda');
+      result = await runStage('lightpanda', () => this.tryLightpanda(url, config));
+      method = 'lightpanda';
+      if (this._isUsable(result)) {
+        this.log('  ✅ Lightpanda successful');
+        return finish(result, method);
+      }
+
+      this.log('  ❌ Lightpanda not usable, falling back to Puppeteer');
+      this.log('  🔵 Attempting Puppeteer...');
+      fallbackChain.push('puppeteer');
+      result = await runStage('puppeteer', () => this.tryPuppeteer(url, config));
+      method = 'puppeteer';
+      if (this._isUsable(result)) {
+        this.log('  ✅ Puppeteer successful');
+        return finish(result, method);
+      }
+
+      this.log('  ❌ All methods exhausted');
+      const transportOk = result.transportSuccess ?? Boolean(result.success);
+      return finish(result, transportOk ? method : 'failed');
     } catch (error) {
+      trace.finish({ outcome: 'error', error });
+      const record = trace.toJSON();
+      this.emit('trace', record);
       return {
         success: false,
+        transportSuccess: false,
         method: 'error',
+        engine: null,
         error: error.message,
-        performance: {
-          totalTime: Date.now() - startTime
-        }
+        errorType: this.categorizeError(error.message),
+        contentStatus: CONTENT_STATUS.NAVIGATION_ERROR,
+        contentReasons: [`error:${String(error.message).slice(0, 80)}`],
+        httpStatus: null,
+        finalUrl: url,
+        redirectChain: [],
+        performance: { totalTime: Date.now() - startTime },
+        trace: record,
       };
     }
   }
-  
+
+  /** Classification of a stage result; engines that return a document are judged on it. */
+  _classify(result) {
+    if (!result) return { status: CONTENT_STATUS.NAVIGATION_ERROR, reasons: ['error:no result'] };
+    if (result.contentStatus) return { status: result.contentStatus, reasons: result.contentReasons || [] };
+    if (typeof result.html === 'string' && result.html.length > 0) {
+      return classifyContent({ httpStatus: result.httpStatus ?? null, html: result.html, error: result.success ? null : result.error });
+    }
+    if (result.success) return { status: CONTENT_STATUS.USABLE, reasons: [] };
+    return { status: CONTENT_STATUS.NAVIGATION_ERROR, reasons: [`error:${String(result.error || 'unknown').slice(0, 80)}`] };
+  }
+
+  _isUsable(result) {
+    const transportOk = result.transportSuccess ?? Boolean(result.success);
+    return transportOk && this._classify(result).status === CONTENT_STATUS.USABLE;
+  }
+
+  /** Build the public result from a stage result. */
+  async _finalize(url, result, method, config, { startTime, fallbackChain, trace }) {
+    const cls = this._classify(result);
+    const transportSuccess = result.transportSuccess ?? Boolean(result.success);
+    let contentStatus = cls.status;
+    let contentReasons = cls.reasons;
+    const html = typeof result.html === 'string' ? result.html : '';
+    const text = html ? stripHtmlToText(html) : '';
+
+    if (transportSuccess && contentStatus === CONTENT_STATUS.USABLE && typeof config.acceptContent === 'function') {
+      let verdict;
+      try {
+        verdict = await config.acceptContent({ status: contentStatus, reasons: contentReasons, text, html, httpStatus: result.httpStatus ?? null, finalUrl: result.finalUrl || url, content: result.content });
+      } catch (err) {
+        verdict = `acceptContent threw: ${err.message}`;
+      }
+      if (verdict !== true) {
+        contentStatus = 'rejected_by_caller';
+        contentReasons = [typeof verdict === 'string' && verdict ? verdict : 'acceptContent'];
+      }
+    }
+
+    const success = transportSuccess && contentStatus === CONTENT_STATUS.USABLE;
+    const error = result.error || (success ? undefined : `content_${contentStatus}`);
+    const errorType = result.errorType ?? (success ? undefined : (contentStatus === CONTENT_STATUS.BLOCKED ? 'blocked' : this.categorizeError(error)));
+    const traceOutcome = success ? 'ok' : 'error';
+    const traceRecord = trace.finish({ outcome: traceOutcome });
+
+    const out = {
+      ...result,
+      success,
+      transportSuccess,
+      method,
+      engine: method === 'failed' || method === 'error' ? null : method,
+      httpStatus: result.httpStatus ?? null,
+      finalUrl: result.finalUrl || url,
+      redirectChain: Array.isArray(result.redirectChain) ? result.redirectChain : [],
+      contentStatus,
+      contentReasons,
+      textLength: text.length,
+      performance: { totalTime: Date.now() - startTime, method },
+      stats: this.getStats(),
+      trace: traceRecord,
+    };
+    if (error !== undefined) out.error = error; else delete out.error;
+    if (errorType !== undefined) out.errorType = errorType; else delete out.errorType;
+    if (fallbackChain) out.fallbackChain = fallbackChain;
+    delete out.isPdf;
+    return out;
+  }
+
   /**
-   * Direct HTTP fetch - fastest method for simple sites
+   * Direct HTTP fetch - fastest method for simple sites.
+   * Follows redirects manually (max 10) so the chain is reported, keeps the
+   * body of 4xx/5xx responses so block pages can be classified.
    */
   async tryDirectFetch(url, config) {
     this.stats.directFetch.attempts++;
-    
+    const headers = {
+      'User-Agent': config.userAgent,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Upgrade-Insecure-Requests': '1',
+    };
+    const redirectChain = [];
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), config.timeout);
+    const signal = config.signal ? AbortSignal.any([config.signal, controller.signal]) : controller.signal;
+
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), config.timeout);
-      
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': config.userAgent,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'gzip, deflate',
-          'Connection': 'keep-alive',
-          'Upgrade-Insecure-Requests': '1'
-        },
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        return {
-          success: false,
-          error: `Direct fetch failed: HTTP ${response.status}: ${response.statusText}`,
-          errorType: response.status === 404 ? 'service_unavailable' : 'network'
-        };
+      let current = url;
+      let response = null;
+      for (let hop = 0; hop <= 10; hop++) {
+        response = await fetch(current, { headers, signal, redirect: 'manual' });
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get('location');
+          if (!location) break;
+          redirectChain.push({ url: current, status: response.status });
+          await response.arrayBuffer().catch(() => {});
+          if (hop === 10) throw new Error('too many redirects (>10)');
+          current = new URL(location, current).toString();
+          response = null;
+          continue;
+        }
+        break;
       }
-      
-      // Check if the response is actually a PDF
+      if (!response) throw new Error('redirect without a final response');
+
+      const httpStatus = response.status;
+      const finalUrl = current;
+      const base = { transportSuccess: true, httpStatus, finalUrl, redirectChain };
+
       const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('application/pdf')) {
-        return {
-          success: false,
-          error: 'Content is PDF, should use PDF parser',
-          isPdf: true
-        };
+        return { ...base, success: false, error: 'Content is PDF, should use PDF parser', isPdf: true };
       }
-      
-      // Get response as array buffer to check magic bytes
+
       const buffer = await response.arrayBuffer();
       const firstBytes = new Uint8Array(buffer.slice(0, 5));
       const signature = Array.from(firstBytes).map(b => String.fromCharCode(b)).join('');
-      
-      // Check for PDF magic bytes
       if (signature.startsWith('%PDF')) {
-        return {
-          success: false,
-          error: 'Content is PDF (detected by magic bytes), should use PDF parser',
-          isPdf: true
-        };
+        return { ...base, success: false, error: 'Content is PDF (detected by magic bytes), should use PDF parser', isPdf: true };
       }
-      
-      // Convert buffer back to text for HTML processing
+
       const html = new TextDecoder().decode(buffer);
-      
-      // Intelligent browser detection
-      const needsBrowser = this.detectBrowserRequirement(html, url);
-      
-      if (!needsBrowser) {
-        const content = this.extractContentFromHTML(html);
-        this.stats.directFetch.successes++;
-        
+      const cls = classifyContent({ httpStatus, html });
+
+      if (!response.ok) {
         return {
-          success: true,
-          needsBrowser: false,
-          content,
+          ...base,
+          success: false,
           html,
           size: html.length,
-          contentType: response.headers.get('content-type') || 'text/html'
+          contentType,
+          contentStatus: cls.status,
+          contentReasons: cls.reasons,
+          error: `Direct fetch failed: HTTP ${httpStatus}: ${response.statusText}`,
+          errorType: cls.status === CONTENT_STATUS.BLOCKED ? 'blocked' : (httpStatus === 404 ? 'service_unavailable' : 'network'),
         };
-      } else {
+      }
+
+      const needsBrowser = this.detectBrowserRequirement(html, finalUrl) || cls.status === CONTENT_STATUS.SHELL;
+      if (needsBrowser) {
         return {
+          ...base,
           success: true,
           needsBrowser: true,
           html,
           size: html.length,
-          browserIndicators: this.getBrowserIndicators(html)
+          contentType,
+          contentStatus: cls.status === CONTENT_STATUS.USABLE ? CONTENT_STATUS.SHELL : cls.status,
+          contentReasons: cls.status === CONTENT_STATUS.USABLE ? ['needs_browser'] : cls.reasons,
+          browserIndicators: this.getBrowserIndicators(html),
         };
       }
-      
+
+      const content = this.extractContentFromHTML(html);
+      if (cls.status === CONTENT_STATUS.USABLE) this.stats.directFetch.successes++;
+      return {
+        ...base,
+        success: true,
+        needsBrowser: false,
+        content,
+        html,
+        size: html.length,
+        contentType: contentType || 'text/html',
+        contentStatus: cls.status,
+        contentReasons: cls.reasons,
+      };
     } catch (error) {
       const errorMsg = error.message || 'Unknown error';
       return {
         success: false,
+        transportSuccess: false,
+        httpStatus: null,
+        finalUrl: url,
+        redirectChain,
         error: `Direct fetch failed: ${errorMsg}`,
-        errorType: this.categorizeError(errorMsg)
+        errorType: this.categorizeError(errorMsg),
       };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
-  
+
   /**
-   * Lightpanda browser - fast browser engine for static/SSR sites
+   * Lightpanda browser - fast browser engine for static/SSR sites.
+   * Uses `fetch --json` so the HTTP status, final URL and navigation error
+   * come back structured instead of being inferred from exit codes.
    */
   async tryLightpanda(url, config) {
     this.stats.lightpanda.attempts++;
-    
+
     if (!this.options.lightpandaPath) {
       return {
         success: false,
+        transportSuccess: false,
         error: 'Lightpanda scraping failed: Lightpanda binary not found. Please install Lightpanda or provide path.',
-        errorType: 'service_unavailable'
+        errorType: 'service_unavailable',
       };
     }
-    
     try {
-      // Check if binary exists
-      const stats = statSync(this.options.lightpandaPath);
-      if (!stats.isFile()) {
-        return {
-          success: false,
-          error: 'Lightpanda scraping failed: Lightpanda binary is not a file',
-          errorType: 'service_unavailable'
-        };
+      if (!statSync(this.options.lightpandaPath).isFile()) {
+        return { success: false, transportSuccess: false, error: 'Lightpanda scraping failed: Lightpanda binary is not a file', errorType: 'service_unavailable' };
       }
     } catch {
-      return {
-        success: false,
-        error: 'Lightpanda scraping failed: Lightpanda binary not accessible',
-        errorType: 'service_unavailable'
-      };
+      return { success: false, transportSuccess: false, error: 'Lightpanda scraping failed: Lightpanda binary not accessible', errorType: 'service_unavailable' };
     }
-    
+
+    const format = config.lightpandaFormat || 'html';
+    const timeout = Math.max(1000, Number(config.timeout) || 10000);
+    const waitMs = Math.min(config.lightpandaWaitMs ?? 5000, timeout);
+    const args = [
+      'fetch',
+      '--json',
+      '--dump', format,
+      '--with-frames',
+      '--http-timeout', String(timeout),
+      '--wait-ms', String(waitMs),
+      '--terminate-ms', String(timeout + 2000),
+      url,
+    ];
+
     return new Promise((resolve) => {
-      const format = config.lightpandaFormat || 'html';
-      const args = [
-        'fetch',
-        '--dump', format,
-        '--with_frames',
-        '--http_timeout', String(config.timeout),
-        url
-      ];
-      const process = spawn(this.options.lightpandaPath, args, {
-        timeout: config.timeout + 2000 // Buffer above http_timeout
+      const child = this._spawn(this.options.lightpandaPath, args, { timeout: timeout + 5000, signal: config.signal });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => { stdout += d.toString(); });
+      child.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 8000) stderr = stderr.slice(-8000); });
+
+      child.on('error', (error) => {
+        resolve({ success: false, transportSuccess: false, error: `Lightpanda scraping failed: ${error.message}`, errorType: this.categorizeError(error.message) });
       });
 
-      let output = '';
-      let errorOutput = '';
-
-      process.stdout.on('data', (data) => {
-        output += data.toString();
-      });
-
-      process.stderr.on('data', (data) => {
-        errorOutput += data.toString();
-      });
-
-      process.on('close', (code) => {
-        if (code === 0 && output.length > 0) {
-          // Markdown output is already clean text, no HTML extraction needed
-          const content = format === 'markdown'
-            ? JSON.stringify({
-                title: output.match(/^#\s+(.+)$/m)?.[1] || '',
-                content: output,
-                extractedAt: new Date().toISOString()
-              }, null, 2)
-            : this.extractContentFromHTML(output);
-          this.stats.lightpanda.successes++;
-
-          resolve({
-            success: true,
-            content,
-            html: output,
-            size: output.length,
-            exitCode: code
-          });
-        } else {
-          const errorMsg = errorOutput || `Lightpanda exited with code ${code}`;
-          resolve({
-            success: false,
-            error: `Lightpanda scraping failed: ${errorMsg}`,
-            errorType: this.categorizeError(errorMsg),
-            exitCode: code
-          });
+      child.on('close', (code, signal) => {
+        if (/has crashed|Fatal V8 Error|\$level=fatal/.test(stderr)) {
+          resolve({ success: false, transportSuccess: false, error: `Lightpanda crashed: ${stderr.split('\n').find(l => l.includes('fatal') || l.includes('reason:')) || 'fatal error'}`, errorType: 'engine_crash', exitCode: code });
+          return;
         }
-      });
-
-      process.on('error', (error) => {
+        let payload = null;
+        const jsonStart = stdout.indexOf('{');
+        if (jsonStart !== -1) {
+          try { payload = JSON.parse(stdout.slice(jsonStart)); } catch { payload = null; }
+        }
+        if (!payload) {
+          const reason = signal ? `terminated by ${signal}` : `exited with code ${code}`;
+          resolve({ success: false, transportSuccess: false, error: `Lightpanda scraping failed: ${stderr.trim() || reason}`, errorType: this.categorizeError(stderr || reason), exitCode: code });
+          return;
+        }
+        if (payload.error) {
+          resolve({ success: false, transportSuccess: false, httpStatus: payload.http_status ?? null, finalUrl: payload.url || url, redirectChain: [], error: `Lightpanda navigation failed: ${payload.error}`, errorType: this.categorizeError(payload.error), exitCode: code });
+          return;
+        }
+        const html = typeof payload.content === 'string' ? payload.content : '';
+        const httpStatus = payload.http_status ?? null;
+        const finalUrl = payload.url || url;
+        const cls = classifyContent({ httpStatus, html });
+        const content = format === 'markdown'
+          ? JSON.stringify({ title: html.match(/^#\s+(.+)$/m)?.[1] || '', content: html, extractedAt: new Date().toISOString() }, null, 2)
+          : this.extractContentFromHTML(html);
+        if (cls.status === CONTENT_STATUS.USABLE) this.stats.lightpanda.successes++;
         resolve({
-          success: false,
-          error: `Lightpanda scraping failed: ${error.message}`,
-          errorType: this.categorizeError(error.message)
+          success: html.length > 0,
+          transportSuccess: true,
+          httpStatus,
+          finalUrl,
+          redirectChain: [],
+          content,
+          html,
+          size: html.length,
+          contentStatus: cls.status,
+          contentReasons: cls.reasons,
+          exitCode: code,
+          ...(html.length === 0 && { error: 'Lightpanda returned an empty document', errorType: 'parsing' }),
         });
       });
     });
   }
-  
+
+  /** Test seam for child processes. */
+  _spawn(cmd, args, opts) {
+    return spawn(cmd, args, opts);
+  }
+
   /**
    * Puppeteer browser - full Chromium for complex JavaScript sites
    */
@@ -676,6 +715,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     if (!puppeteer) {
       return {
         success: false,
+        transportSuccess: false,
         error: 'Puppeteer scraping failed: Puppeteer is not installed. Please install puppeteer package.',
         errorType: 'service_unavailable'
       };
@@ -705,10 +745,16 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
       });
       
       // Navigate with timeout
-      await page.goto(url, { 
-        waitUntil: 'networkidle0', 
-        timeout: config.timeout 
+      const response = await page.goto(url, {
+        waitUntil: 'networkidle0',
+        timeout: config.timeout,
       });
+      const httpStatus = response ? response.status() : null;
+      const redirectChain = response
+        ? response.request().redirectChain().map(r => ({ url: r.url(), status: r.response()?.status() ?? null }))
+        : [];
+      const finalUrl = page.url();
+      const html = await page.content();
       
       // Extract content using browser APIs
       const content = await page.evaluate(() => {
@@ -771,18 +817,30 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         };
       });
       
-      this.stats.puppeteer.successes++;
+      const cls = classifyContent({ httpStatus, html });
+      if (cls.status === CONTENT_STATUS.USABLE) this.stats.puppeteer.successes++;
       
       return {
         success: true,
+        transportSuccess: true,
+        httpStatus,
+        finalUrl,
+        redirectChain,
         content: JSON.stringify(content, null, 2),
-        size: JSON.stringify(content).length
+        html,
+        size: html.length,
+        contentStatus: cls.status,
+        contentReasons: cls.reasons,
       };
       
     } catch (error) {
       const errorMsg = error.message || 'Unknown error';
       return {
         success: false,
+        transportSuccess: false,
+        httpStatus: null,
+        finalUrl: url,
+        redirectChain: [],
         error: `Puppeteer scraping failed: ${errorMsg}`,
         errorType: this.categorizeError(errorMsg)
       };
@@ -1165,7 +1223,13 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     
     const error = errorMessage.toLowerCase();
     
-    if (error.includes('timeout') || error.includes('timed out') || error.includes('abort')) {
+    if (error.includes('crashed') || error.includes('fatal v8')) {
+      return 'engine_crash';
+    } else if (error.includes('cancelled') || error.includes('canceled') || error.includes('aborted')) {
+      return 'cancelled';
+    } else if (error.includes('access denied') || error.includes('blocked') || error.includes('http 403') || error.includes('http 429')) {
+      return 'blocked';
+    } else if (error.includes('timeout') || error.includes('timed out') || error.includes('abort')) {
       return 'timeout';
     } else if (error.includes('network') || error.includes('enotfound') || error.includes('econnrefused') || error.includes('econnreset')) {
       return 'network';
@@ -1184,16 +1248,6 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
   log(message) {
     if (this.options.verbose) {
       console.log(message);
-    }
-  }
-  
-  /**
-   * Cleanup resources
-   */
-  async cleanup() {
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
     }
   }
   
@@ -1551,8 +1605,9 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
           results.stats.successful++;
           
           // Track method usage
-          if (result.method) {
-            results.stats.methods[result.method]++;
+          const key = result.method === 'direct-fetch' ? 'direct' : result.method;
+          if (key && key in results.stats.methods) {
+            results.stats.methods[key]++;
           }
           
           return successResult;
@@ -1787,5 +1842,7 @@ export { BrowserSession, createSession } from './browser-session.js';
 export { default as LightPandaServer, getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
 export { ComputerUseProvider } from './computer-use-provider.js';
 export { LocalProvider } from './providers/local-provider.js';
+
+export { CONTENT_STATUS, classifyContent };
 
 export default BNCASmartScraper;

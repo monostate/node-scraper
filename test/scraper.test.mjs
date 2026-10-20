@@ -61,8 +61,9 @@ describe('Fallback Chain', () => {
     scraper.tryLightpanda = async () => ({
       success: true,
       content: JSON.stringify({ title: 'SPA', content: 'Rendered' }),
-      html: '<html><body>Rendered</body></html>',
-      size: 100,
+      // v3 judges engines on the document they return: a few characters is "empty"
+      html: '<html><body><p>' + 'Rendered SPA content paragraph. '.repeat(8) + '</p></body></html>',
+      size: 300,
       exitCode: 0
     });
 
@@ -125,8 +126,8 @@ describe('Fallback Chain', () => {
     scraper.tryLightpanda = async () => ({
       success: true,
       content: JSON.stringify({ title: 'OK' }),
-      html: '<html></html>',
-      size: 50,
+      html: '<html><body><p>' + 'Page content delivered by Lightpanda. '.repeat(6) + '</p></body></html>',
+      size: 260,
       exitCode: 0
     });
 
