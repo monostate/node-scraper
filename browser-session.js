@@ -1,6 +1,6 @@
 import { getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
 import browserPool, { buildLaunchArgs } from './browser-pool.js';
-import { redactUrl } from './redact.js';
+import { redactUrl, SENSITIVE_FIELD_RE } from './redact.js';
 
 const FALLBACK_REASONS = {
   SCREENSHOT: 'screenshot_requested',
@@ -9,6 +9,25 @@ const FALLBACK_REASONS = {
   NAVIGATION_FAILED: 'navigation_after_click_failed',
   METHOD_NOT_SUPPORTED: 'method_not_supported',
 };
+
+/**
+ * SAFE actions may be transparently retried on another engine after a
+ * failure; MUTATING actions are never replayed once dispatched — an error
+ * after dispatch yields { outcome: 'uncertain' } and the caller decides.
+ */
+export const ACTION_KIND = Object.freeze({ SAFE: 'safe', MUTATING: 'mutating' });
+
+export const ACTION_KINDS = Object.freeze({
+  goto: ACTION_KIND.SAFE, goBack: ACTION_KIND.SAFE, goForward: ACTION_KIND.SAFE, scroll: ACTION_KIND.SAFE,
+  hover: ACTION_KIND.SAFE, extractContent: ACTION_KIND.SAFE, evaluate: ACTION_KIND.SAFE, waitFor: ACTION_KIND.SAFE,
+  screenshot: ACTION_KIND.SAFE, getPageState: ACTION_KIND.SAFE,
+  click: ACTION_KIND.MUTATING, type: ACTION_KIND.MUTATING, select: ACTION_KIND.MUTATING, pressKey: ACTION_KIND.MUTATING,
+  typeText: ACTION_KIND.MUTATING, clickAt: ACTION_KIND.MUTATING, doubleClickAt: ACTION_KIND.MUTATING, drag: ACTION_KIND.MUTATING,
+  uploadFile: ACTION_KIND.MUTATING,
+});
+
+const CHECKPOINT_NOT_TRANSFERABLE = Object.freeze(['indexedDB', 'serviceWorkers', 'openTabs', 'inFlightRequests', 'history']);
+const SENSITIVE_AUTOCOMPLETE = ['one-time-code', 'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'new-password', 'current-password'];
 
 export class BrowserSession {
   /**
@@ -157,19 +176,20 @@ export class BrowserSession {
 
   // ── Navigation ──────────────────────────────────────────────
 
-  async goto(url) {
+  async goto(url, options = {}) {
     this._ensureConnected();
     try {
-      await this.page.goto(url, {
-        waitUntil: 'networkidle0',
-        timeout: this.timeout,
+      const response = await this.page.goto(url, {
+        waitUntil: options.waitUntil || 'networkidle0',
+        timeout: options.timeout || this.timeout,
       });
-      this._logAction('goto', { url });
-      return { success: true, url: this.page.url() };
+      const httpStatus = response ? response.status() : null;
+      this._logAction('goto', { url, httpStatus });
+      return { success: true, outcome: 'ok', url: this.page.url(), httpStatus };
     } catch (err) {
       if (await this._shouldFallback(err)) {
         await this._fallbackToChrome(FALLBACK_REASONS.CDP_ERROR);
-        return this.goto(url);
+        return this.goto(url, options);
       }
       throw err;
     }
@@ -191,34 +211,52 @@ export class BrowserSession {
 
   async click(selector, options = {}) {
     this._ensureConnected();
+    let dispatched = false;
     try {
       await this.page.waitForSelector(selector, { timeout: options.timeout || this.timeout });
       const urlBefore = this.page.url();
+      dispatched = true;
       await this.page.click(selector);
 
-      // If navigation expected, wait briefly
+      // Wait briefly for a navigation the click may have started. A timeout
+      // means "no navigation happened" (fine); any other error means the
+      // request left but no usable response came back (uncertain).
+      let navError = null;
       if (options.waitForNavigation !== false) {
         try {
-          await this.page.waitForNavigation({ timeout: 3000, waitUntil: 'networkidle0' }).catch(() => {});
-        } catch {
-          // No navigation happened, that's fine
+          await this.page.waitForNavigation({ timeout: options.navigationTimeout ?? 3000, waitUntil: 'networkidle0' });
+        } catch (err) {
+          if (!/timeout/i.test(err.message || '')) navError = err;
         }
+      }
+
+      const urlAfter = this.page.url();
+      if (navError || urlAfter.startsWith('chrome-error://')) {
+        const uncertainReason = navError
+          ? `navigation_error:${navError.message}`
+          : 'navigation_error:response_dropped';
+        this._logAction('click', { selector, outcome: 'uncertain', uncertainReason });
+        return { success: false, outcome: 'uncertain', uncertainReason, error: navError?.message || 'no response after click', url: urlAfter };
+      }
+
+      // LightPanda sometimes swallows click-triggered navigation. The click
+      // was dispatched, so it is not replayed: move to Chrome and report.
+      if (this.activeBackend === 'lightpanda' && options.expectNavigation && urlBefore === urlAfter) {
+        this._log('Click did not trigger expected navigation on LightPanda — switching to Chrome without replaying');
+        await this._fallbackToChrome(FALLBACK_REASONS.NAVIGATION_FAILED);
+        const uncertainReason = 'navigation_expected_not_observed';
+        this._logAction('click', { selector, outcome: 'uncertain', uncertainReason });
+        return { success: false, outcome: 'uncertain', uncertainReason, url: this.page.url(), backend: this.activeBackend };
       }
 
       this._logAction('click', { selector });
-
-      // Check for LP's known click-navigation bug
-      if (this.activeBackend === 'lightpanda') {
-        const urlAfter = this.page.url();
-        if (options.expectNavigation && urlBefore === urlAfter) {
-          this._log('Click did not trigger expected navigation — falling back to Chrome');
-          await this._fallbackToChrome(FALLBACK_REASONS.NAVIGATION_FAILED);
-          return this.click(selector, { ...options, _retried: true });
-        }
-      }
-
-      return { success: true, url: this.page.url() };
+      return { success: true, outcome: 'ok', url: urlAfter };
     } catch (err) {
+      if (dispatched) {
+        const uncertainReason = `error_after_dispatch:${err.message}`;
+        this._logAction('click', { selector, outcome: 'uncertain', uncertainReason });
+        return { success: false, outcome: 'uncertain', uncertainReason, error: err.message };
+      }
       if (await this._shouldFallback(err)) {
         await this._fallbackToChrome(FALLBACK_REASONS.CDP_ERROR);
         return this.click(selector, options);
@@ -229,18 +267,23 @@ export class BrowserSession {
 
   async type(selector, text, options = {}) {
     this._ensureConnected();
+    let dispatched = false;
     try {
       await this.page.waitForSelector(selector, { timeout: options.timeout || this.timeout });
-
+      dispatched = true;
       if (options.clear) {
         await this.page.click(selector, { clickCount: 3 });
         await this.page.keyboard.press('Backspace');
       }
-
       await this.page.type(selector, text, { delay: options.delay || 0 });
       this._logAction('type', { selector, text });
-      return { success: true };
+      return { success: true, outcome: 'ok' };
     } catch (err) {
+      if (dispatched) {
+        const uncertainReason = `error_after_dispatch:${err.message}`;
+        this._logAction('type', { selector, outcome: 'uncertain', uncertainReason });
+        return { success: false, outcome: 'uncertain', uncertainReason, error: err.message };
+      }
       if (await this._shouldFallback(err)) {
         await this._fallbackToChrome(FALLBACK_REASONS.CDP_ERROR);
         return this.type(selector, text, options);
@@ -254,7 +297,7 @@ export class BrowserSession {
     const deltaY = direction === 'up' ? -amount : amount;
     await this.page.evaluate((dy) => window.scrollBy(0, dy), deltaY);
     this._logAction('scroll', { direction, amount });
-    return { success: true };
+    return { success: true, outcome: 'ok' };
   }
 
   async hover(selector) {
@@ -271,22 +314,35 @@ export class BrowserSession {
     await this.page.waitForSelector(selector, { timeout: this.timeout });
     await this.page.hover(selector);
     this._logAction('hover', { selector });
-    return { success: true };
+    return { success: true, outcome: 'ok' };
   }
 
   async select(selector, ...values) {
     this._ensureConnected();
     await this.page.waitForSelector(selector, { timeout: this.timeout });
-    await this.page.select(selector, ...values);
+    try {
+      await this.page.select(selector, ...values);
+    } catch (err) {
+      const uncertainReason = `error_after_dispatch:${err.message}`;
+      this._logAction('select', { selector, outcome: 'uncertain', uncertainReason });
+      return { success: false, outcome: 'uncertain', uncertainReason, error: err.message };
+    }
     this._logAction('select', { selector, values });
-    return { success: true };
+    return { success: true, outcome: 'ok' };
   }
 
+  /** Page (CDP) keyboard input — works in every mode. See desktopKey() for native input. */
   async pressKey(key) {
     this._ensureConnected();
-    await this.page.keyboard.press(key);
+    try {
+      await this.page.keyboard.press(key);
+    } catch (err) {
+      const uncertainReason = `error_after_dispatch:${err.message}`;
+      this._logAction('pressKey', { key, outcome: 'uncertain', uncertainReason });
+      return { success: false, outcome: 'uncertain', uncertainReason, error: err.message };
+    }
     this._logAction('pressKey', { key });
-    return { success: true };
+    return { success: true, outcome: 'ok' };
   }
 
   // ── Content Extraction ──────────────────────────────────────
@@ -574,6 +630,179 @@ export class BrowserSession {
     return this._providerInfo?.vncUrl || null;
   }
 
+  // ── Checkpoint / restore ────────────────────────────────────
+
+  /**
+   * Capture what can be carried to another engine: URL, cookies (incl.
+   * HttpOnly via CDP when available), web storage and non-sensitive form
+   * values. `notTransferable` names what is lost on an engine switch.
+   */
+  async checkpoint() {
+    this._ensureConnected();
+    const captured = [];
+    const cp = {
+      url: this.page.url(),
+      cookies: [],
+      localStorage: {},
+      sessionStorage: {},
+      formValues: [],
+      captured,
+      notTransferable: [...CHECKPOINT_NOT_TRANSFERABLE],
+    };
+
+    try {
+      cp.cookies = await this._getAllCookies();
+      captured.push('cookies');
+    } catch (err) {
+      this._log(`checkpoint: cookies unavailable (${err.message})`);
+    }
+
+    try {
+      const storage = await this.page.evaluate(() => {
+        const dump = (store) => {
+          const out = {};
+          for (let i = 0; i < store.length; i++) { const k = store.key(i); out[k] = store.getItem(k); }
+          return out;
+        };
+        return { local: dump(localStorage), session: dump(sessionStorage) };
+      });
+      cp.localStorage = storage.local || {};
+      cp.sessionStorage = storage.session || {};
+      captured.push('localStorage', 'sessionStorage');
+    } catch (err) {
+      this._log(`checkpoint: storage unavailable (${err.message})`);
+    }
+
+    try {
+      cp.formValues = await this.page.evaluate((sensitiveSource, sensitiveAutocomplete) => {
+        const sensitive = new RegExp(sensitiveSource, 'i');
+        const sensAc = new Set(sensitiveAutocomplete);
+        const out = [];
+        document.querySelectorAll('input, textarea, select').forEach((el) => {
+          if (!el.name && !el.id) return;
+          const type = (el.type || '').toLowerCase();
+          if (['hidden', 'submit', 'button', 'reset', 'file', 'image', 'password'].includes(type)) return;
+          if (sensAc.has((el.getAttribute('autocomplete') || '').toLowerCase().trim())) return;
+          const label = (el.labels && el.labels[0] && el.labels[0].textContent) || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+          if ([el.name, el.id, label].some(v => v && sensitive.test(String(v)))) return;
+          const selector = el.id ? `#${CSS.escape(el.id)}` : `[name=${JSON.stringify(el.name)}]`;
+          const entry = { selector, tag: el.tagName.toLowerCase(), type };
+          if (type === 'checkbox' || type === 'radio') entry.checked = el.checked; else entry.value = el.value;
+          out.push(entry);
+        });
+        return out;
+      }, SENSITIVE_FIELD_RE.source, SENSITIVE_AUTOCOMPLETE);
+      captured.push('formValues');
+    } catch (err) {
+      this._log(`checkpoint: form values unavailable (${err.message})`);
+    }
+
+    return cp;
+  }
+
+  /**
+   * Re-apply a checkpoint to this session. Never throws for an item the
+   * browser rejects; every such item is reported in `skipped`.
+   */
+  async restore(cp) {
+    this._ensureConnected();
+    const restored = [];
+    const skipped = [];
+    if (!cp) return { restored, skipped };
+
+    if (Array.isArray(cp.cookies) && cp.cookies.length > 0) {
+      let ok = 0;
+      for (const raw of cp.cookies) {
+        const cookie = this._sanitizeCookie(raw);
+        if (!cookie) { skipped.push({ item: `cookie:${raw?.name}`, reason: 'invalid cookie' }); continue; }
+        try {
+          await this.setCookies([cookie]);
+          ok++;
+        } catch (err) {
+          skipped.push({ item: `cookie:${cookie.name}`, reason: err.message });
+        }
+      }
+      if (ok > 0) restored.push('cookies');
+    }
+
+    if (cp.url && cp.url !== 'about:blank' && !cp.url.startsWith('chrome-error://')) {
+      try {
+        await this.page.goto(cp.url, { waitUntil: 'networkidle0', timeout: this.timeout });
+        restored.push('url');
+      } catch (err) {
+        skipped.push({ item: 'url', reason: err.message });
+        for (const item of cp.notTransferable || []) skipped.push({ item, reason: 'not transferable' });
+        return { restored, skipped };
+      }
+    }
+
+    const local = cp.localStorage || {};
+    const session = cp.sessionStorage || {};
+    if (Object.keys(local).length || Object.keys(session).length) {
+      try {
+        await this.page.evaluate((l, s) => {
+          for (const [k, v] of Object.entries(l)) localStorage.setItem(k, v);
+          for (const [k, v] of Object.entries(s)) sessionStorage.setItem(k, v);
+        }, local, session);
+        if (Object.keys(local).length) restored.push('localStorage');
+        if (Object.keys(session).length) restored.push('sessionStorage');
+      } catch (err) {
+        skipped.push({ item: 'storage', reason: err.message });
+      }
+    }
+
+    if (Array.isArray(cp.formValues) && cp.formValues.length > 0) {
+      try {
+        const result = await this.page.evaluate((values) => {
+          let applied = 0;
+          const missing = [];
+          for (const f of values) {
+            const el = document.querySelector(f.selector);
+            if (!el) { missing.push(f.selector); continue; }
+            if ('checked' in f) el.checked = f.checked; else el.value = f.value;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            applied++;
+          }
+          return { applied, missing };
+        }, cp.formValues);
+        if (result.applied > 0) restored.push('formValues');
+        for (const m of result.missing) skipped.push({ item: `form:${m}`, reason: 'element not found' });
+      } catch (err) {
+        skipped.push({ item: 'formValues', reason: err.message });
+      }
+    }
+
+    for (const item of cp.notTransferable || []) skipped.push({ item, reason: 'not transferable' });
+    return { restored, skipped };
+  }
+
+  async _getAllCookies() {
+    // CDP Network.getAllCookies includes HttpOnly cookies for every domain
+    try {
+      const client = await this.page.createCDPSession();
+      try {
+        const { cookies } = await client.send('Network.getAllCookies');
+        return cookies || [];
+      } finally {
+        await client.detach().catch(() => {});
+      }
+    } catch {
+      return this.page.cookies();
+    }
+  }
+
+  _sanitizeCookie(c) {
+    if (!c || typeof c.name !== 'string') return null;
+    const out = { name: c.name, value: c.value == null ? '' : String(c.value) };
+    for (const key of ['domain', 'path', 'expires', 'httpOnly', 'secure', 'sameSite']) {
+      if (c[key] !== undefined && c[key] !== null) out[key] = c[key];
+    }
+    if (out.expires === -1 || out.expires === 0) delete out.expires;
+    if (out.sameSite && !['Strict', 'Lax', 'None'].includes(out.sameSite)) delete out.sameSite;
+    return out;
+  }
+
   // ── Fallback ────────────────────────────────────────────────
 
   async _fallbackToChrome(reason) {
@@ -582,15 +811,14 @@ export class BrowserSession {
 
     this._log(`Falling back to Chrome: ${reason}`);
     this._fallbackCount++;
+    const from = this.activeBackend;
 
-    // Save state from LP session
-    let cookies = [];
-    let currentUrl = null;
+    // Capture everything we can carry over; LP may be in a bad state.
+    let cp = null;
     try {
-      cookies = await this.page.cookies();
-      currentUrl = this.page.url();
-    } catch {
-      // LP might be in a bad state
+      cp = await this.checkpoint();
+    } catch (err) {
+      this._log(`checkpoint failed before fallback: ${err.message}`);
     }
 
     // Close LP page (keep server alive for potential reuse)
@@ -602,21 +830,17 @@ export class BrowserSession {
       // ignore cleanup errors
     }
 
-    // Connect to Chrome
     await this._connectChrome();
 
-    // Restore state
-    if (cookies.length > 0) {
-      await this.page.setCookie(...cookies);
-    }
-    if (currentUrl && currentUrl !== 'about:blank') {
-      await this.page.goto(currentUrl, {
-        waitUntil: 'networkidle0',
-        timeout: this.timeout,
-      });
-    }
-
-    this._logAction('fallback', { reason, from: 'lightpanda', to: 'chrome' });
+    const { restored, skipped } = await this.restore(cp);
+    this._logAction('fallback', {
+      reason,
+      from,
+      to: 'chrome',
+      restored,
+      skipped: skipped.filter(s => s.reason !== 'not transferable').map(s => s.item),
+      notTransferable: cp?.notTransferable || [...CHECKPOINT_NOT_TRANSFERABLE],
+    });
   }
 
   async _shouldFallback(error) {

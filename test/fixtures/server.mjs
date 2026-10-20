@@ -113,6 +113,10 @@ export async function startFixtureServer({ port = 0 } = {}) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     requests.push({ method: req.method, path: url.pathname, at: Date.now(), cookie: req.headers.cookie || '' });
+    // No keep-alive: Chromium silently re-sends a request (even a POST) when a
+    // *reused* socket dies before a response arrives. Fresh sockets make the
+    // dropped-response fixture observe exactly the writes the client issued.
+    res.setHeader('Connection', 'close');
 
     const html = (status, title, body, headers = {}) => {
       res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', ...headers });
@@ -205,6 +209,17 @@ export async function startFixtureServer({ port = 0 } = {}) {
       default:
         return html(404, 'Not found', `<p>No fixture at ${url.pathname}</p>`);
     }
+  });
+
+  // Chromium preconnects idle sockets on navigation and treats them as
+  // "reused", which makes it silently re-send a request (even a POST) when
+  // such a socket dies without a response. Closing sockets that never send a
+  // request keeps the dropped-response fixture observing exactly the writes
+  // the client issued.
+  server.on('connection', (socket) => {
+    const reaper = setTimeout(() => socket.destroy(), 150);
+    socket.once('data', () => clearTimeout(reaper));
+    socket.once('close', () => clearTimeout(reaper));
   });
 
   server.listen(port, '127.0.0.1');
