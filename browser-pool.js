@@ -330,9 +330,12 @@ export class BrowserPool extends EventEmitter {
 
   // ── Shutdown ──────────────────────────────────────────────────
 
-  /** Reject waiters, close every browser, refuse new acquisitions until reopen(). */
+  /**
+   * Drain: reject waiting callers, close every browser. The pool stays usable
+   * (a later getBrowser() launches again) — this is what scraper.cleanup()
+   * relies on when it periodically frees memory in a long-lived process.
+   */
   async closeAll() {
-    this.closed = true;
     if (this.cleanupTimer) {
       clearTimeout(this.cleanupTimer);
       this.cleanupTimer = null;
@@ -344,6 +347,12 @@ export class BrowserPool extends EventEmitter {
     this.busyBrowsers.clear();
     await Promise.all(entries.map(e => this._closeInstance(e.instance)));
     this.emit('closed');
+  }
+
+  /** Permanent close: like closeAll(), and every later getBrowser() rejects with PoolClosedError until reopen(). */
+  async shutdown() {
+    this.closed = true;
+    await this.closeAll();
   }
 
   reopen() {
@@ -369,6 +378,6 @@ const browserPool = new BrowserPool();
 
 // Best-effort cleanup when the host process goes away. No SIGTERM/SIGINT
 // listeners: a library must not swallow the host's termination signals.
-process.once('beforeExit', () => { browserPool.closeAll().catch(() => {}); });
+process.once('beforeExit', () => { browserPool.shutdown().catch(() => {}); });
 
 export default browserPool;

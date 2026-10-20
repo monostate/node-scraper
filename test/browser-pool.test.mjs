@@ -122,9 +122,9 @@ describe('BrowserPool queue', () => {
     first.catch(() => {});
   });
 
-  it('closeAll() rejects queued callers and later acquisitions', async () => {
+  it('closeAll() rejects queued callers, closes browsers, and the pool stays usable', async () => {
     pool = makePool();
-    await fillPool(pool);
+    const held = await fillPool(pool);
     const q1 = pool.getBrowser();
     const q2 = pool.getBrowser();
     const t0 = Date.now();
@@ -132,6 +132,18 @@ describe('BrowserPool queue', () => {
     await assert.rejects(q1, (e) => e instanceof PoolClosedError && e.code === 'POOL_CLOSED');
     await assert.rejects(q2, PoolClosedError);
     assert.ok(Date.now() - t0 < 500);
+    assert.ok(held.every(b => !b.isConnected()), 'all browsers closed');
+    assert.equal(pool.getStats().poolSize, 0);
+    const b = await pool.getBrowser(); // drain is not permanent
+    assert.ok(b && b.isConnected());
+  });
+
+  it('shutdown() refuses later acquisitions until reopen()', async () => {
+    pool = makePool();
+    await fillPool(pool);
+    const q = pool.getBrowser();
+    await pool.shutdown();
+    await assert.rejects(q, PoolClosedError);
     await assert.rejects(pool.getBrowser(), PoolClosedError);
     pool.reopen();
     const b = await pool.getBrowser();
