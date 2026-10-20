@@ -76,7 +76,7 @@ describe('Chrome visual mode', { timeout: TIMEOUT }, () => {
     const content = await session.extractContent();
     assert.ok(content.title.includes('Example'));
     assert.ok(content.url.includes('example.com'));
-    assert.ok(content.headings.length > 0);
+    assert.ok(content.paragraphs.length > 0); // example.com dropped its <h1> in 2026
     assert.ok(content.bodyText.length > 0);
   });
 
@@ -170,7 +170,7 @@ describe('Chrome interactions', { timeout: TIMEOUT }, () => {
 
   it('waitFor finds existing elements', async () => {
     await session.goto(EXAMPLE_URL);
-    const result = await session.waitFor('h1', 5000);
+    const result = await session.waitFor('p', 5000); // example.com dropped its <h1> in 2026
     assert.equal(result.success, true);
   });
 
@@ -357,7 +357,7 @@ describe('Auto mode with fallback', { timeout: TIMEOUT * 2 }, () => {
 
     // hover triggers fallback since LP doesn't support mouseMoved
     // After fallback, page reloads so h1 should be available
-    const result = await session.hover('h1');
+    const result = await session.hover('p'); // example.com dropped its <h1> in 2026
     assert.equal(result.success, true);
     assert.equal(session.activeBackend, 'chrome');
   });

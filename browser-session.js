@@ -1,5 +1,6 @@
 import { getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
-import browserPool from './browser-pool.js';
+import browserPool, { buildLaunchArgs } from './browser-pool.js';
+import { redactUrl } from './redact.js';
 
 const FALLBACK_REASONS = {
   SCREENSHOT: 'screenshot_requested',
@@ -12,7 +13,14 @@ const FALLBACK_REASONS = {
 export class BrowserSession {
   /**
    * @param {object} options
-   * @param {'headless'|'visual'|'auto'|'computer-use'} options.mode - 'headless' (LightPanda), 'visual' (Chrome visible), 'auto' (LP with Chrome fallback), 'computer-use' (provider with Xvfb+VNC)
+   * @param {'headless'|'chrome'|'visual'|'auto'|'computer-use'} options.mode - 'headless' (LightPanda), 'chrome' (pooled headless Chrome), 'visual' (Chrome visible), 'auto' (LP with Chrome fallback), 'computer-use' (provider with Xvfb+VNC)
+   * @param {boolean} [options.isolate=true] - Fresh browser context per session on pooled Chrome (cookies/storage never shared)
+   * @param {boolean} [options.recordTypedText=false] - Keep typed text in the action history (redacted by default)
+   * @param {boolean} [options.redact=true] - Redact URLs/text in history and logs
+   * @param {boolean} [options.noSandbox] - Launch Chrome without its sandbox (containers); default keeps the sandbox on
+   * @param {boolean} [options.disableWebSecurity] - Disable same-origin policy in Chrome (off by default)
+   * @param {number} [options.acquireTimeout=30000] - Max wait for a pooled browser
+   * @param {AbortSignal} [options.signal] - Abort connecting/queued acquisition
    * @param {number} options.timeout - Navigation timeout in ms (default: 15000)
    * @param {string} options.userAgent - Custom user agent
    * @param {string} options.lightpandaPath - Path to LightPanda binary
@@ -26,6 +34,15 @@ export class BrowserSession {
     this.userAgent = options.userAgent || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
     this.lightpandaPath = options.lightpandaPath;
     this.verbose = options.verbose || false;
+    this.isolate = options.isolate ?? !(options.persistent === true);
+    this.recordTypedText = options.recordTypedText ?? false;
+    this.redact = options.redact ?? true;
+    this.acquireTimeout = options.acquireTimeout ?? 30000;
+    this.signal = options.signal || null;
+    this.launch = {
+      ...(options.noSandbox !== undefined && { noSandbox: options.noSandbox }),
+      ...(options.disableWebSecurity !== undefined && { disableWebSecurity: options.disableWebSecurity }),
+    };
 
     this.browser = null;
     this.context = null;
@@ -48,6 +65,8 @@ export class BrowserSession {
 
     if (this.mode === 'computer-use') {
       await this._connectViaProvider();
+    } else if (this.mode === 'chrome') {
+      await this._connectChrome();
     } else if (this.mode === 'visual') {
       await this._connectChromeVisual();
     } else {
@@ -83,9 +102,13 @@ export class BrowserSession {
   }
 
   async _connectChrome() {
-    this._chromeBrowser = await browserPool.getBrowser();
+    if (Object.keys(this.launch).length > 0) browserPool.configure({ launch: this.launch });
+    this._chromeBrowser = await browserPool.getBrowser({ timeout: this.acquireTimeout, signal: this.signal || undefined });
     this.browser = this._chromeBrowser;
-    this.page = await this.browser.newPage();
+    // Fresh context per session: cookies, storage, IndexedDB and service
+    // workers never leak between sessions sharing a pooled browser.
+    this.context = this.isolate ? await this.browser.createBrowserContext() : null;
+    this.page = await (this.context ?? this.browser).newPage();
 
     await this.page.setUserAgent(this.userAgent);
     await this.page.setViewport({ width: 1280, height: 800 });
@@ -97,12 +120,12 @@ export class BrowserSession {
     const puppeteer = await this._getPuppeteer();
     this.browser = await puppeteer.launch({
       headless: false,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--window-size=1280,800',
-      ],
+      executablePath: process.env.BNCA_CHROME_PATH || undefined,
+      args: buildLaunchArgs({
+        noSandbox: this.launch.noSandbox ?? process.env.BNCA_CHROME_NO_SANDBOX === '1',
+        disableWebSecurity: this.launch.disableWebSecurity ?? false,
+        extraArgs: ['--window-size=1280,800'],
+      }),
     });
     this.page = await this.browser.newPage();
     await this.page.setUserAgent(this.userAgent);
@@ -215,7 +238,7 @@ export class BrowserSession {
       }
 
       await this.page.type(selector, text, { delay: options.delay || 0 });
-      this._logAction('type', { selector, text: text.substring(0, 20) + (text.length > 20 ? '...' : '') });
+      this._logAction('type', { selector, text });
       return { success: true };
     } catch (err) {
       if (await this._shouldFallback(err)) {
@@ -531,7 +554,7 @@ export class BrowserSession {
       this._ensureProvider();
       await this.provider.typeText(text);
     }
-    this._logAction('typeText', { text: text.substring(0, 20) + (text.length > 20 ? '...' : '') });
+    this._logAction('typeText', { text });
     return { success: true };
   }
 
@@ -667,9 +690,23 @@ export class BrowserSession {
   }
 
   _logAction(type, params = {}) {
-    const entry = { type, ...params, timestamp: Date.now(), backend: this.activeBackend };
+    const safe = this._redactParams(params);
+    const entry = { type, ...safe, timestamp: Date.now(), backend: this.activeBackend };
     this.history.push(entry);
-    this._log(`${type} ${JSON.stringify(params)}`);
+    this._log(`${type} ${JSON.stringify(safe)}`);
+    return entry;
+  }
+
+  /** Strip typed text (unless recordTypedText) and mask URL secrets before anything is recorded. */
+  _redactParams(params) {
+    if (!this.redact) return params;
+    const out = { ...params };
+    if ('text' in out && !this.recordTypedText) {
+      out.textLength = out.text == null ? 0 : String(out.text).length;
+      delete out.text;
+    }
+    if (typeof out.url === 'string') out.url = redactUrl(out.url);
+    return out;
   }
 
   getHistory() {

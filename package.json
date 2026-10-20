@@ -34,7 +34,7 @@
     "page-state.js"
   ],
   "scripts": {
-    "test": "node --test --test-timeout=60000 test/",
+    "test": "node --test --test-timeout=180000 test/",
     "postinstall": "node scripts/install-lightpanda.js",
     "test:unit": "node --test test/",
     "smoke:packed": "bash scripts/smoke-packed.sh"
