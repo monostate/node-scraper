@@ -22,7 +22,6 @@
     "README.md",
     "BULK_SCRAPING.md",
     "package.json",
-    "scripts/",
     "redact.js",
     "deadline.js",
     "process-util.js",
@@ -31,7 +30,9 @@
     "capabilities.js",
     "telemetry.js",
     "keymap.js",
-    "page-state.js"
+    "page-state.js",
+    "scripts/install-lightpanda.js",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "test": "node --test --test-timeout=180000 test/",
