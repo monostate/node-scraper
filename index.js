@@ -55,106 +55,118 @@ export class BNCASmartScraper extends EventEmitter {
   }
   
   /**
-   * Ask AI a question about a URL
-   * Scrapes the URL and uses AI to answer the question
-   * 
-   * @param {string} url - URL to analyze
-   * @param {string} question - Question to answer
-   * @param {object} options - Additional options
-   * @returns {Promise<object>} AI response with answer
+   * Ask AI a question about a URL: scrape it, then answer with the first
+   * configured provider — OpenRouter, OpenAI, an explicit `aiEndpoint`, or
+   * the local heuristic. There is no implicit hosted endpoint: a bare
+   * `apiKey` without `aiEndpoint` is ignored (with a one-time warning).
+   *
+   * @param {string} url
+   * @param {string} question
+   * @param {object} [options]
+   * @param {string} [options.openRouterApiKey] (or OPENROUTER_API_KEY)
+   * @param {string} [options.openAIApiKey] (or OPENAI_API_KEY)
+   * @param {string} [options.aiEndpoint] - Your own HTTP endpoint; receives POST { url, question } with header x-api-key: aiApiKey
+   * @param {string} [options.aiApiKey]
+   * @returns {Promise<{ success: boolean, answer?: string, error?: string, method?: string, contentStatus?: string, scrapeTime?: number, processing?: 'openrouter'|'openai'|'endpoint'|'local', usage?: { provider: string, model: string|null, inputTokens: number|null, outputTokens: number|null }, trace?: object }>}
    */
   async askAI(url, question, options = {}) {
+    const trace = new Trace({ operation: 'askAI', url });
     try {
-      // First scrape the content
+      const scrapeStage = trace.stage('scrape');
       const scrapeResult = await this.scrape(url, options);
-      
+      scrapeStage.end({ outcome: scrapeResult.success ? 'ok' : 'error', httpStatus: scrapeResult.httpStatus ?? null, reason: scrapeResult.contentStatus, error: scrapeResult.success ? undefined : scrapeResult.error });
+
       if (!scrapeResult.success) {
         return {
           success: false,
           error: `Failed to scrape URL: ${scrapeResult.error}`,
-          method: scrapeResult.method
+          method: scrapeResult.method,
+          contentStatus: scrapeResult.contentStatus,
+          trace: trace.finish({ outcome: 'error' }),
         };
       }
-      
-      // Check for OpenRouter/OpenAI API key
+
       const openRouterKey = options.openRouterApiKey || this.options.openRouterApiKey || process.env.OPENROUTER_API_KEY;
       const openAIKey = options.openAIApiKey || this.options.openAIApiKey || process.env.OPENAI_API_KEY;
-      
-      // Priority: OpenRouter > OpenAI > Backend API > Local
+      const aiEndpoint = options.aiEndpoint || this.options.aiEndpoint;
+      const aiApiKey = options.aiApiKey || this.options.aiApiKey;
+      const merged = { ...this.options, ...options };
+
+      const done = (processing, answer, usage) => {
+        if (usage) trace.setUsage(usage);
+        return {
+          success: true,
+          answer,
+          method: scrapeResult.method,
+          scrapeTime: scrapeResult.performance?.totalTime ?? scrapeResult.stats?.totalTime,
+          processing,
+          ...(usage && { usage }),
+          trace: trace.finish({ outcome: 'ok' }),
+        };
+      };
+
       if (openRouterKey) {
+        const stage = trace.stage('openrouter', { engine: 'openrouter' });
         try {
-          const answer = await this.processWithOpenRouter(question, scrapeResult.content, openRouterKey, options);
-          return {
-            success: true,
-            answer,
-            method: scrapeResult.method,
-            scrapeTime: scrapeResult.stats.totalTime,
-            processing: 'openrouter'
-          };
+          const { answer, usage } = await this.processWithOpenRouter(question, scrapeResult.content, openRouterKey, merged);
+          stage.end({ outcome: 'ok' });
+          return done('openrouter', answer, usage);
         } catch (error) {
-          this.log('  ⚠️ OpenRouter API call failed, falling back...');
+          stage.end({ outcome: 'error', error });
+          this.log(`  ⚠️ OpenRouter API call failed (${error.message}), falling back...`);
         }
       }
-      
+
       if (openAIKey) {
+        const stage = trace.stage('openai', { engine: 'openai' });
         try {
-          const answer = await this.processWithOpenAI(question, scrapeResult.content, openAIKey, options);
-          return {
-            success: true,
-            answer,
-            method: scrapeResult.method,
-            scrapeTime: scrapeResult.stats.totalTime,
-            processing: 'openai'
-          };
+          const { answer, usage } = await this.processWithOpenAI(question, scrapeResult.content, openAIKey, merged);
+          stage.end({ outcome: 'ok' });
+          return done('openai', answer, usage);
         } catch (error) {
-          this.log('  ⚠️ OpenAI API call failed, falling back...');
+          stage.end({ outcome: 'error', error });
+          this.log(`  ⚠️ OpenAI API call failed (${error.message}), falling back...`);
         }
       }
-      
-      // If BNCA API key is provided, use the backend API
-      if (this.options.apiKey) {
+
+      if (aiEndpoint) {
+        const stage = trace.stage('endpoint', { engine: 'endpoint' });
         try {
-          const response = await fetch(`${this.options.apiUrl || 'https://bnca-api.fly.dev'}/aireply`, {
+          const response = await fetch(aiEndpoint, {
             method: 'POST',
-            headers: {
-              'x-api-key': this.options.apiKey,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ url, question })
+            headers: { 'Content-Type': 'application/json', ...(aiApiKey && { 'x-api-key': aiApiKey }) },
+            body: JSON.stringify({ url, question }),
+            signal: merged.signal,
           });
-          
-          if (response.ok) {
-            const data = await response.json();
-            return {
-              success: true,
-              answer: data.answer,
-              method: scrapeResult.method,
-              scrapeTime: scrapeResult.stats.totalTime,
-              processing: 'backend'
-            };
-          }
+          if (!response.ok) throw new Error(`endpoint returned HTTP ${response.status}`);
+          const data = await response.json();
+          stage.end({ outcome: 'ok', httpStatus: response.status });
+          return done('endpoint', data.answer, data.usage ? this._normalizeUsage('endpoint', data) : null);
         } catch (error) {
-          this.log('  ⚠️ Backend API call failed, using local AI processing');
+          stage.end({ outcome: 'error', error });
+          this.log(`  ⚠️ aiEndpoint call failed (${error.message}), using local processing`);
         }
+      } else if (merged.apiKey && !BNCASmartScraper._warnedLegacyApiKey) {
+        BNCASmartScraper._warnedLegacyApiKey = true;
+        console.warn('[node-scraper] options.apiKey is ignored in v3: the hosted AI endpoint was removed. Pass { aiEndpoint, aiApiKey } explicitly to use your own service.');
       }
-      
-      // Local AI processing fallback
+
       const answer = this.processLocally(question, scrapeResult.content);
-      
-      return {
-        success: true,
-        answer,
-        method: scrapeResult.method,
-        scrapeTime: scrapeResult.stats.totalTime,
-        processing: 'local'
-      };
-      
+      return done('local', answer, null);
     } catch (error) {
-      return {
-        success: false,
-        error: error.message || 'AI processing failed'
-      };
+      return { success: false, error: error.message || 'AI processing failed', trace: trace.finish({ outcome: 'error', error }) };
     }
+  }
+
+  /** Map an OpenAI-style usage block to the package's shape. */
+  _normalizeUsage(provider, data) {
+    const u = data?.usage || {};
+    return {
+      provider,
+      model: data?.model ?? null,
+      inputTokens: u.prompt_tokens ?? u.input_tokens ?? null,
+      outputTokens: u.completion_tokens ?? u.output_tokens ?? null,
+    };
   }
   
   /**
@@ -171,14 +183,17 @@ Meta Description: ${parsedContent.metaDescription || 'None'}
 ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h => `- ${h.text || h}`).join('\n')}` : ''}
 `.trim();
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    const baseUrl = (options.openRouterBaseUrl || 'https://openrouter.ai/api').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
         'HTTP-Referer': options.referer || 'https://github.com/monostate/node-scraper',
+        ...(options.signal ? {} : {}),
         'X-Title': 'BNCA Node Scraper',
       },
+      signal: options.signal,
       body: JSON.stringify({
         model: options.model || 'meta-llama/llama-4-scout:free',
         messages: [
@@ -201,7 +216,10 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     }
 
     const data = await response.json();
-    return data.choices[0]?.message?.content || 'No response from AI';
+    return {
+      answer: data.choices?.[0]?.message?.content || 'No response from AI',
+      usage: this._normalizeUsage('openrouter', { ...data, model: data.model || options.model || 'meta-llama/llama-4-scout:free' }),
+    };
   }
 
   /**
@@ -225,6 +243,7 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
       },
+      signal: options.signal,
       body: JSON.stringify({
         model: options.model || 'gpt-3.5-turbo',
         messages: [
@@ -247,7 +266,10 @@ ${parsedContent.headings?.length ? `\nHeadings:\n${parsedContent.headings.map(h 
     }
 
     const data = await response.json();
-    return data.choices[0]?.message?.content || 'No response from AI';
+    return {
+      answer: data.choices?.[0]?.message?.content || 'No response from AI',
+      usage: this._normalizeUsage('openai', { ...data, model: data.model || options.model || 'gpt-3.5-turbo' }),
+    };
   }
 
   /**
@@ -1885,12 +1907,28 @@ export async function bulkScrapeStream(urls, options = {}) {
   }
 }
 
+/** Live statistics of the shared Chrome pool. */
+export function getBrowserPoolStats() {
+  return browserPool.getStats();
+}
+
 // Browser session exports
-export { BrowserSession, createSession } from './browser-session.js';
+export { BrowserSession, createSession, ACTION_KIND, ACTION_KINDS } from './browser-session.js';
 export { default as LightPandaServer, getLightPandaServer, stopLightPandaServer } from './lightpanda-server.js';
 export { ComputerUseProvider } from './computer-use-provider.js';
 export { LocalProvider } from './providers/local-provider.js';
 
-export { CONTENT_STATUS, classifyContent };
+// Infrastructure exports (v3)
+export { BrowserPool, buildLaunchArgs, PoolClosedError, PoolQueueFullError, PoolAcquireTimeoutError, PoolAbortedError } from './browser-pool.js';
+export { Deadline, DeadlineError } from './deadline.js';
+export { CONTENT_STATUS, classifyContent, stripHtmlToText } from './content-status.js';
+export { findChromePath, CHROME_CANDIDATES } from './chrome-path.js';
+export { checkCapabilities, requireCapability, CapabilityError, INSTALL_HINTS } from './capabilities.js';
+export { Trace } from './telemetry.js';
+export { redactUrl, redactErrorMessage, redactText, redactValue, isSensitiveField, SENSITIVE_FIELD_RE } from './redact.js';
+export { normalizeXdoKey } from './keymap.js';
+export { collectPageState, DEFAULT_REF_ATTR } from './page-state.js';
+export { LIGHTPANDA_VERSION, LIGHTPANDA_CHECKSUMS, installLightpanda, assetNameFor } from './scripts/install-lightpanda.js';
+export { terminate, waitForHttpOk, waitForTcp, waitForPath, findFreePort, makeTempDir, removeDir, minimalEnv, allocateDisplay } from './process-util.js';
 
 export default BNCASmartScraper;
