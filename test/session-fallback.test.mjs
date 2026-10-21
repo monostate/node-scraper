@@ -168,3 +168,30 @@ describe('LightPanda → Chrome fallback carries state', { timeout: TIMEOUT, ski
     assert.match(body, /qa-session=local-audit/);
   });
 });
+
+// Audit item 9 reproduced a cookie missing from a form POST on Lightpanda v0.2.5.
+// This pins the behaviour of the 1.0.1 build we now ship: the cookie set by the
+// page response travels on the submit, and the CSRF field reaches the server.
+describe('Lightpanda 1.0.1 stateful forms (fixture)', { timeout: TIMEOUT, skip: !lpAvailable && 'LightPanda not installed' }, () => {
+  let fx;
+  before(async () => { fx = await startFixtureServer(); });
+  after(async () => { await stopLightPandaServer(); await fx.close(); });
+
+  it('sends the session cookie and CSRF token on a form POST without leaving Lightpanda', async () => {
+    const s = await createSession({ mode: 'headless', timeout: 15000 });
+    assert.equal(s.getBackend(), 'lightpanda');
+    await s.goto(`${fx.url}/forms/basic`);
+    assert.equal(await s.evaluate(() => document.cookie), 'qa-session=local-audit');
+    await fillBasic(s);
+    const r = await s.click('#submit', { waitForNavigation: true });
+    assert.equal(r.outcome, 'ok');
+    assert.equal(s.getBackend(), 'lightpanda');
+    await s.close();
+    assert.equal(fx.attempts.length, 1, 'exactly one POST reached the fixture');
+    const post = fx.attempts[0];
+    assert.equal(post.valid, true, JSON.stringify(post));
+    assert.match(post.cookie, /qa-session=local-audit/);
+    assert.equal(post.fields.csrf, 'local-audit-token');
+    assert.equal(post.fields.name, 'Fallback Tester');
+  });
+});
