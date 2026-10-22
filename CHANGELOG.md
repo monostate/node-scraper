@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [3.1.0] - 2026-10-22
 
 ### Security
 - Require **Node.js >= 22.23.4** (`engines`; `.nvmrc` pins it, `engine-strict` enforces it on `npm install`): the
