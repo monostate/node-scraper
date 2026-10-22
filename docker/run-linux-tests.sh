@@ -6,9 +6,9 @@ cd "$(dirname "$0")/.."
 PLATFORM=""
 if [ "${1:-}" = "--platform" ]; then PLATFORM="$2"; shift 2; fi
 if [ -n "$PLATFORM" ]; then
-  docker build --platform "$PLATFORM" -f docker/Dockerfile.test -t node-scraper-test .
+  docker build --pull --platform "$PLATFORM" -f docker/Dockerfile.test -t node-scraper-test .
   docker run --rm --platform "$PLATFORM" --shm-size=1g "$@" node-scraper-test
 else
-  docker build -f docker/Dockerfile.test -t node-scraper-test .
+  docker build --pull -f docker/Dockerfile.test -t node-scraper-test .
   docker run --rm --shm-size=1g "$@" node-scraper-test
 fi

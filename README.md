@@ -22,13 +22,19 @@ npm install @monostate/node-scraper
 npm install puppeteer
 ```
 
+Requires **Node.js 22.23.4 or newer**. The direct-fetch stage decodes
+brotli responses from arbitrary sites with Node's own decoder, and 22.23.4
+([October 2026 security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases))
+fixes an out-of-bounds write in it. Node 20 and older are end-of-life and
+no longer receive security fixes.
+
 `postinstall` downloads the pinned Lightpanda release (1.0.1, SHA-256
 verified, atomic). It never fails the install; it prints one status line.
 Opt out with `BNCA_SKIP_LIGHTPANDA_INSTALL=1`, or point the package at your
 own binary with `LIGHTPANDA_PATH=/path/to/lightpanda`.
 
 Platforms: Lightpanda ships for macOS and Linux (x86_64, aarch64). **The Linux
-binaries need glibc ≥ 2.38** — Debian 13 "trixie" (`node:22-trixie-slim`),
+binaries need glibc ≥ 2.38** — Debian 13 "trixie" (`node:22.23.4-trixie-slim`),
 Ubuntu 24.04 or newer; Debian 12 "bookworm" (`node:22-slim` today) cannot run
 them and the installer says so. Computer-use mode is Linux only
 (`apt-get install xvfb xdotool chromium`, optional `x11vnc imagemagick`).

@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Security
+- Require **Node.js >= 22** (`engines`), and run on **22.23.4 or newer**: the
+  [October 2026 Node.js security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
+  fixes a brotli decoder out-of-bounds write (CVE-2026-111497, remote code
+  execution) that the direct-fetch stage is exposed to when a site answers with
+  `content-encoding: br`, plus TLS hostname checks for non-canonical IP hosts
+  (CVE-2026-106069, CVE-2026-106072) and a keep-alive response desync
+  (CVE-2026-105481). Node 20 is end-of-life and always affected.
+- Docker test image and the computer-use example are pinned to
+  `node:22.23.4-trixie-slim`; `docker/run-linux-tests.sh` builds with `--pull`.
+- CI no longer tests Node 20.
+
 ## [3.0.0] - 2026-10-20
 
 Hardening release driven by an external audit of 2.2.2 (session isolation,
