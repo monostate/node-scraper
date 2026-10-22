@@ -26,7 +26,9 @@ Requires **Node.js 22.23.4 or newer**. The direct-fetch stage decodes
 brotli responses from arbitrary sites with Node's own decoder, and 22.23.4
 ([October 2026 security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases))
 fixes an out-of-bounds write in it. Node 20 and older are end-of-life and
-no longer receive security fixes.
+no longer receive security fixes. `.nvmrc` pins 22.23.4 for contributors and CI,
+and `engine-strict=true` in `.npmrc` makes `npm install` in this repo refuse an
+older Node.
 
 `postinstall` downloads the pinned Lightpanda release (1.0.1, SHA-256
 verified, atomic). It never fails the install; it prints one status line.

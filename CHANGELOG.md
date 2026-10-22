@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Security
-- Require **Node.js >= 22** (`engines`), and run on **22.23.4 or newer**: the
+- Require **Node.js >= 22.23.4** (`engines`; `.nvmrc` pins it, `engine-strict` enforces it on `npm install`): the
   [October 2026 Node.js security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
   fixes a brotli decoder out-of-bounds write (CVE-2026-111497, remote code
   execution) that the direct-fetch stage is exposed to when a site answers with
@@ -12,7 +12,7 @@
   (CVE-2026-105481). Node 20 is end-of-life and always affected.
 - Docker test image and the computer-use example are pinned to
   `node:22.23.4-trixie-slim`; `docker/run-linux-tests.sh` builds with `--pull`.
-- CI no longer tests Node 20.
+- CI installs the Node version from `.nvmrc` and no longer tests Node 20.
 
 ## [3.0.0] - 2026-10-20
 
